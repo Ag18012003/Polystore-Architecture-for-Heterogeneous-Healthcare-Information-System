@@ -1,7 +1,7 @@
 import cors from 'cors';
 import 'dotenv/config';
 import express from 'express';
-import { connectDB } from './config/db.js';
+import { connectDB, connectMySQL } from './config/db.js';
 
 // ⭐ ADD CLERK MIDDLEWARE
 import { clerkMiddleware } from "@clerk/express";
@@ -43,8 +43,9 @@ app.use(clerkMiddleware());
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ limit: "20mb", extended: true }));
 
-// Database Connection
+// Database Connections
 connectDB();
+connectMySQL();
 
 // Static uploads folder
 

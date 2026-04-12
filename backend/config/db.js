@@ -1,9 +1,45 @@
 import mongoose from "mongoose";
+import mysql from "mysql2/promise";
 
-export const connectDB = async ()=> {
-  await mongoose.connect("")
-  .then(() => {console.log("DB connected")})
-}
+// ─── MongoDB ────────────────────────────────────────────────────────────────
+export const connectDB = async () => {
+  await mongoose
+    .connect(process.env.MONGODB_URI || "")
+    .then(() => {
+      console.log("MongoDB connected");
+    })
+    .catch((err) => {
+      console.error("MongoDB connection error:", err.message);
+    });
+};
+
+// ─── MySQL ───────────────────────────────────────────────────────────────────
+let _mysqlPool = null;
+
+/** Returns the MySQL connection pool (null until connectMySQL() has been called). */
+export const getMysqlPool = () => _mysqlPool;
+
+export const connectMySQL = async () => {
+  try {
+    _mysqlPool = mysql.createPool({
+      host: process.env.MYSQL_HOST || "localhost",
+      user: process.env.MYSQL_USER || "root",
+      password: process.env.MYSQL_PASSWORD || "",
+      database: process.env.MYSQL_DATABASE || "healthcare_db",
+      port: parseInt(process.env.MYSQL_PORT || "3306", 10),
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0,
+    });
+
+    // Verify connectivity
+    const connection = await _mysqlPool.getConnection();
+    connection.release();
+    console.log("MySQL connected");
+  } catch (err) {
+    console.error("MySQL connection error:", err.message);
+  }
+};
 
 
 // ✨ Step-by-step Instructions (Follow Step 1, then Step 2, then Step 3, …)

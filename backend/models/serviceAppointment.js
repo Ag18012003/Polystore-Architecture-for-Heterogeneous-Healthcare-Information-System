@@ -132,7 +132,7 @@ const serviceAppointmentSchema = new mongoose.Schema(
       },
 
       providerId: {
-        type: String, // Stripe payment_intent id
+        type: String, // payment provider transaction id
         default: "",
       },
 
@@ -142,7 +142,7 @@ const serviceAppointmentSchema = new mongoose.Schema(
       },
 
       sessionId: {
-        type: String, // Stripe checkout session id
+        type: String, // payment session id
         default: "",
         index: true,
       },

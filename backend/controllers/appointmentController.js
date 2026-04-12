@@ -1,5 +1,4 @@
 // controllers/appointmentController.js
-import Stripe from "stripe";
 import Appointment from "../models/Appointment.js";
 import Doctor from "../models/Doctor.js";
 import dotenv from "dotenv";
@@ -7,23 +6,11 @@ import { getAuth } from "@clerk/express";
 import { clerkClient } from "@clerk/clerk-sdk-node";
 dotenv.config();
 
-const STRIPE_KEY = process.env.STRIPE_SECRET_KEY;
-const FRONTEND_URL = process.env.FRONTEND_URL;
 const MAJOR_ADMIN_ID = process.env.MAJOR_ADMIN_ID || null;
-const stripe = STRIPE_KEY ? new Stripe(STRIPE_KEY, { apiVersion: "2023-10-16" }) : null;
 
 const safeNumber = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
-};
-
-const buildFrontendBase = (req) => {
-  if (FRONTEND_URL) return FRONTEND_URL.replace(/\/$/, "");
-  const origin = req.get("origin") || req.get("referer");
-  if (origin) return origin.replace(/\/$/, "");
-  const host = req.get("host");
-  if (host) return `${req.protocol || "http"}://${host}`.replace(/\/$/, "");
-  return null;
 };
 
 function resolveClerkUserId(req) {
@@ -247,62 +234,13 @@ export const createAppointment = async (req, res) => {
       return res.status(201).json({ success: true, appointment: created, checkoutUrl: null });
     }
 
-    // Online: Stripe
-    if (!stripe) return res.status(500).json({ success: false, message: "Stripe not configured on server" });
-
-    const frontBase = buildFrontendBase(req);
-    if (!frontBase) {
-      return res.status(500).json({ success: false, message: "Frontend URL could not be determined. Set FRONTEND_URL or send Origin header." });
-    }
-
-    const successUrl = `${frontBase}/appointment/success?session_id={CHECKOUT_SESSION_ID}`;
-    const cancelUrl = `${frontBase}/appointment/cancel`;
-
-    let session;
-    try {
-      session = await stripe.checkout.sessions.create({
-        payment_method_types: ["card"],
-        mode: "payment",
-        customer_email: email || undefined,
-        line_items: [
-          {
-            price_data: {
-              currency: "inr",
-              product_data: { name: `Appointment - ${String(patientName).slice(0, 40)}` },
-              unit_amount: Math.round(numericFee * 100),
-            },
-            quantity: 1,
-          },
-        ],
-        success_url: successUrl,
-        cancel_url: cancelUrl,
-        metadata: {
-          doctorId: String(doctorId),
-          doctorName: doctorName || "",
-          speciality: speciality || "",
-          patientName: base.patientName,
-          mobile: base.mobile,
-          clerkUserId: clerkUserId || "",
-        },
-      });
-    } catch (stripeErr) {
-      console.error("Stripe create session error:", stripeErr);
-      const message = stripeErr?.raw?.message || stripeErr?.message || "Stripe error";
-      return res.status(502).json({ success: false, message: `Payment provider error: ${message}` });
-    }
-
-    try {
-      const created = await Appointment.create({
-        ...base,
-        sessionId: session.id,
-        payment: { ...base.payment, providerId: session.payment_intent || session.paymentIntent || null },
-        status: "Pending",
-      });
-      return res.status(201).json({ success: true, appointment: created, checkoutUrl: session.url || null });
-    } catch (dbErr) {
-      console.error("DB error saving appointment after stripe session:", dbErr);
-      return res.status(500).json({ success: false, message: "Failed to create appointment record" });
-    }
+    // Online payment (no external payment provider — record as Pending)
+    const created = await Appointment.create({
+      ...base,
+      status: "Pending",
+      payment: { method: "Online", status: "Pending", amount: numericFee },
+    });
+    return res.status(201).json({ success: true, appointment: created, checkoutUrl: null });
   } catch (err) {
     console.error("createAppointment unexpected:", err);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -315,76 +253,11 @@ export const confirmPayment = async (req, res) => {
   try {
     const { session_id } = req.query;
     if (!session_id) return res.status(400).json({ success: false, message: "session_id is required" });
-    if (!stripe) return res.status(500).json({ success: false, message: "Stripe not configured" });
 
-    let session;
-    try {
-      session = await stripe.checkout.sessions.retrieve(session_id);
-    } catch (err) {
-      console.error("Stripe retrieve session error:", err);
-      return res.status(404).json({ success: false, message: "Stripe session not found" });
-    }
-    if (!session) return res.status(404).json({ success: false, message: "Invalid session" });
-
-    if (session.payment_status !== "paid") {
-      return res.status(400).json({ success: false, message: "Payment not completed" });
-    }
-
-    // Try match by sessionId first
-    let appt = await Appointment.findOneAndUpdate(
-      { sessionId: session_id },
-      {
-        "payment.status": "Paid",
-        "payment.providerId": session.payment_intent || session.payment_intent_id || null,
-        status: "Confirmed",
-        paidAt: new Date(),
-      },
-      { new: true }
-    );
-
-    // fallback: try match via metadata (doctorId + mobile + patientName)
-    if (!appt) {
-      const meta = session.metadata || {};
-      if (meta.doctorId && meta.mobile && meta.patientName) {
-        appt = await Appointment.findOneAndUpdate(
-          {
-            doctorId: meta.doctorId,
-            mobile: meta.mobile,
-            patientName: meta.patientName,
-            fees: Math.round((session.amount_total || 0) / 100) || undefined,
-          },
-          {
-            "payment.status": "Paid",
-            "payment.providerId": session.payment_intent || null,
-            status: "Confirmed",
-            paidAt: new Date(),
-            sessionId: session_id,
-          },
-          { new: true }
-        );
-      }
-    }
-
-    // last attempt: find appointment created in last 15 minutes with matching amount
-    if (!appt) {
-      const amount = Math.round((session.amount_total || 0) / 100);
-      const fifteenAgo = new Date(Date.now() - 1000 * 60 * 15);
-      appt = await Appointment.findOneAndUpdate(
-        { fees: amount, createdAt: { $gte: fifteenAgo } },
-        {
-          "payment.status": "Paid",
-          "payment.providerId": session.payment_intent || null,
-          status: "Confirmed",
-          paidAt: new Date(),
-          sessionId: session_id,
-        },
-        { new: true }
-      );
-    }
-
-    if (!appt) {
-      return res.status(404).json({ success: false, message: "Appointment not found for this payment session" });
-    }
+    // Sanitize to prevent NoSQL injection
+    const safeSessionId = String(session_id);
+    const appt = await Appointment.findOne({ sessionId: safeSessionId }).lean();
+    if (!appt) return res.status(404).json({ success: false, message: "Appointment not found for this session" });
 
     return res.json({ success: true, appointment: appt });
   } catch (err) {
