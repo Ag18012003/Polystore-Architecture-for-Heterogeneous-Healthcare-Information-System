@@ -1,7 +1,6 @@
 // routes/serviceAppointmentRouter.js
 import express from "express";
-import { clerkMiddleware, requireAuth } from "@clerk/express";
-
+import rateLimit from "express-rate-limit";
 import {
   getServiceAppointments,
   getServiceAppointmentById,
@@ -15,24 +14,29 @@ import {
 
 const router = express.Router();
 
-/* FIXED ROUTES FIRST */
-router.get("/", getServiceAppointments);
-router.get("/confirm", confirmServicePayment);
-router.get("/stats/summary", getServiceAppointmentStats);
+const createLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many requests, please try again later" },
+});
 
-router.post("/", clerkMiddleware(), requireAuth(), createServiceAppointment);
+const readLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many requests, please try again later" },
+});
 
-// 🔥 MUST BE BEFORE :id
-router.get(
-  "/me",
-  clerkMiddleware(),
-  requireAuth(),
-  getServiceAppointmentsByPatient
-);
-
-/* ID ROUTES LAST */
-router.get("/:id", getServiceAppointmentById);
-router.put("/:id", updateServiceAppointment);
-router.post("/:id/cancel", cancelServiceAppointment);
+router.get("/", readLimiter, getServiceAppointments);
+router.get("/confirm", readLimiter, confirmServicePayment);
+router.get("/stats/summary", readLimiter, getServiceAppointmentStats);
+router.post("/", createLimiter, createServiceAppointment);
+router.get("/me", readLimiter, getServiceAppointmentsByPatient);
+router.get("/:id", readLimiter, getServiceAppointmentById);
+router.put("/:id", createLimiter, updateServiceAppointment);
+router.post("/:id/cancel", createLimiter, cancelServiceAppointment);
 
 export default router;

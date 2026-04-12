@@ -53,9 +53,9 @@ export default function LoginPage({ apiBase }) {
         return;
       }
 
-      // doctor id (supports all common API shapes)
+      // doctor id (supports MySQL id and MongoDB _id shapes)
       const doctorId =
-        json?.data?._id || json?.doctor?._id || json?.data?.doctor?._id;
+        json?.data?.id || json?.data?._id || json?.doctor?.id || json?.doctor?._id;
 
       if (!doctorId) {
         toast.error("Doctor ID missing from server response");

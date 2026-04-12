@@ -19,8 +19,7 @@ import {
 import { toast, ToastContainer } from "react-toastify";
 import "react-toastify/dist/ReactToastify.css";
 
-// Clerk client hooks
-import { useAuth, useUser } from "@clerk/clerk-react";
+
 import { doctorDetailStyles } from "../../assets/dummyStyles";
 
 const API_BASE = "http://localhost:4000";
@@ -111,43 +110,12 @@ export default function DoctorDetail() {
   const [paymentMethod, setPaymentMethod] = useState("Cash");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // Clerk hooks
-  const { getToken, isLoaded: authLoaded } = useAuth();
-  const { isSignedIn, user, isLoaded: userLoaded } = useUser();
+  
 
   useEffect(() => {
     setIsVisible(true);
   }, []);
 
-  // Prefill the form fields quietly if user is available (no UI markup change)
-  useEffect(() => {
-    if (!userLoaded) return;
-    if (user) {
-      const fullName =
-        user.fullName ||
-        `${user.firstName || ""} ${user.lastName || ""}`.trim() ||
-        "";
-      const rawPhone =
-        user.primaryPhone ||
-        (user.phoneNumbers && user.phoneNumbers.length > 0
-          ? user.phoneNumbers[0]
-          : "") ||
-        "";
-      const phone = normalizePhoneTo10(rawPhone);
-      const email =
-        (user.emailAddresses && user.emailAddresses[0]?.emailAddress) ||
-        user.primaryEmailAddress ||
-        "";
-
-      setFormData((prev) => ({
-        ...prev,
-        name: prev.name || fullName,
-        mobile: prev.mobile || phone,
-        email: prev.email || email,
-      }));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userLoaded, user]);
 
   useEffect(() => {
     let mounted = true;
@@ -234,22 +202,6 @@ export default function DoctorDetail() {
       return;
     }
 
-    if (!authLoaded || !userLoaded) {
-      toast.error("Authentication not ready. Please try again in a moment.", {
-        position: "top-center",
-        autoClose: 2000,
-      });
-      return;
-    }
-
-    if (!isSignedIn) {
-      toast.error("You must sign in to create an appointment.", {
-        position: "top-center",
-        autoClose: 2200,
-      });
-      return;
-    }
-
     setIsSubmitting(true);
 
     const dateISO = selectedDate.toISOString().split("T")[0]; // YYYY-MM-DD
@@ -269,7 +221,6 @@ export default function DoctorDetail() {
       doctorId: doctor._id || doctor.id,
       doctorName: doctorNameValue,
       speciality: specialityValue,
-      owner: ownerValue,
       // NEW: send image hints (optional — backend prefers DB but accepts these)
       doctorImageUrl: doctor?.imageUrl || doctor?.image || "",
       doctorImagePublicId:
@@ -287,16 +238,10 @@ export default function DoctorDetail() {
     };
 
     try {
-      const token = await getToken();
-      if (!token) {
-        throw new Error("Failed to obtain authentication token.");
-      }
-
       const res = await fetch(`${API_BASE}/api/appointments`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify(payload),
       });
@@ -310,14 +255,7 @@ export default function DoctorDetail() {
         return;
       }
 
-      // If checkoutUrl is returned -> redirect to Stripe Checkout
-      if (body.checkoutUrl) {
-        // redirect user to Stripe Checkout
-        window.location.href = body.checkoutUrl;
-        return;
-      }
-
-      // Booking created (Cash or free)
+      // Booking created
       toast.success("Booking successful", {
         position: "top-center",
         autoClose: 1500,
@@ -325,7 +263,7 @@ export default function DoctorDetail() {
 
       // navigate to appointments list (you can change this path)
       setTimeout(() => {
-        window.location.href = "/appointments?payment_status=Pending";
+        window.location.href = "/appointments";
       }, 700);
     } catch (err) {
       console.error("Booking error:", err);

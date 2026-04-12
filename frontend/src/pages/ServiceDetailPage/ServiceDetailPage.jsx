@@ -9,7 +9,6 @@ import {
   Phone,
 } from "lucide-react";
 import { Link, useParams, useNavigate } from "react-router-dom";
-import { useAuth } from "@clerk/clerk-react";
 import toast, { Toaster } from "react-hot-toast";
 import { serviceDetailStyles, iconSize } from "../../assets/dummyStyles";
 
@@ -19,7 +18,6 @@ export default function ServiceDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
 
-  const { isSignedIn, userId, getToken } = useAuth();
 
   // UI state
   const [selectedDate, setSelectedDate] = useState("");
@@ -278,18 +276,9 @@ export default function ServiceDetail() {
       return;
     }
 
-    // Require Clerk sign-in: show toast and abort if not signed in
-    if (!isSignedIn) {
-      toast.error("Please sign in to create a booking.");
-      return;
-    }
-
-    setSubmitting(true);
+        setSubmitting(true);
     try {
-      // get Clerk token (frontend)
-      const token = await getToken().catch(() => null);
-
-      // payload (replace the existing payload in ServiceDetail.jsx)
+      // payload
       const payload = {
         serviceId:
           (service?.raw && (service.raw._id || service.raw.id)) || service?.id,
@@ -331,17 +320,6 @@ export default function ServiceDetail() {
         Accept: "application/json",
       };
 
-      if (token) {
-        headers.Authorization = `Bearer ${token}`;
-      } else {
-        // No token despite isSignedIn true — show warning and force re-login
-        toast.error(
-          "Authentication token not available. Please sign in again.",
-        );
-        setSubmitting(false);
-        return;
-      }
-
       const res = await fetch(`${DEFAULT_HOST}/api/service-appointments`, {
         method: "POST",
         headers,
@@ -372,18 +350,11 @@ export default function ServiceDetail() {
         return;
       }
 
-      const { appointment, checkoutUrl } = json || {};
-
-      if (checkoutUrl) {
-        window.location.href = checkoutUrl;
-        return;
-      }
-
       toast.success(
         "Booking created successfully. Redirecting to appointments...",
       );
       setTimeout(() => {
-        navigate("/appointments?payment_status=Paid", { replace: true });
+        navigate("/appointments", { replace: true });
       }, 700);
 
       setCustomerName("");
