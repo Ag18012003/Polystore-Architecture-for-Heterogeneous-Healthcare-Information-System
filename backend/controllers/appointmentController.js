@@ -1,29 +1,27 @@
 // controllers/appointmentController.js
-import Stripe from "stripe";
-import Appointment from "../models/Appointment.js";
-import Doctor from "../models/Doctor.js";
+// Polystore: structured data → MySQL (appointments table), semi-structured → MongoDB (AppointmentMeta)
+import pool from "../config/mysql.js";
+import AppointmentMeta from "../models/mongodb/AppointmentMeta.js";
 import dotenv from "dotenv";
 import { getAuth } from "@clerk/express";
 import { clerkClient } from "@clerk/clerk-sdk-node";
+import {
+  newId,
+  query,
+  queryOne,
+  insertRow,
+  updateRow,
+  mapAppointmentRow,
+  toMySQLDatetime,
+} from "../utils/queryHelpers.js";
+
 dotenv.config();
 
-const STRIPE_KEY = process.env.STRIPE_SECRET_KEY;
-const FRONTEND_URL = process.env.FRONTEND_URL;
 const MAJOR_ADMIN_ID = process.env.MAJOR_ADMIN_ID || null;
-const stripe = STRIPE_KEY ? new Stripe(STRIPE_KEY, { apiVersion: "2023-10-16" }) : null;
 
 const safeNumber = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
-};
-
-const buildFrontendBase = (req) => {
-  if (FRONTEND_URL) return FRONTEND_URL.replace(/\/$/, "");
-  const origin = req.get("origin") || req.get("referer");
-  if (origin) return origin.replace(/\/$/, "");
-  const host = req.get("host");
-  if (host) return `${req.protocol || "http"}://${host}`.replace(/\/$/, "");
-  return null;
 };
 
 function resolveClerkUserId(req) {
@@ -42,6 +40,39 @@ function resolveClerkUserId(req) {
   }
 }
 
+async function mergeWithMeta(row) {
+  if (!row) return null;
+  const base = mapAppointmentRow(row);
+  const meta = await AppointmentMeta.findOne({ appointmentId: row.id }).lean();
+  if (meta) {
+    base.notes = meta.notes || "";
+    base.specialRequirements = meta.specialRequirements || "";
+    base.payment = { ...base.payment, meta: meta.paymentMeta || {} };
+    base.auditLog = meta.auditLog || [];
+  }
+  return base;
+}
+
+async function mergeMany(rows) {
+  if (!rows.length) return [];
+  const ids = rows.map((r) => r.id);
+  const metas = await AppointmentMeta.find({ appointmentId: { $in: ids } }).lean();
+  const metaMap = {};
+  metas.forEach((m) => { metaMap[m.appointmentId] = m; });
+
+  return rows.map((row) => {
+    const base = mapAppointmentRow(row);
+    const meta = metaMap[row.id];
+    if (meta) {
+      base.notes = meta.notes || "";
+      base.specialRequirements = meta.specialRequirements || "";
+      base.payment = { ...base.payment, meta: meta.paymentMeta || {} };
+      base.auditLog = meta.auditLog || [];
+    }
+    return base;
+  });
+}
+
 /* ---------------- list / single / by-patient ---------------- */
 
 export const getAppointments = async (req, res) => {
@@ -49,28 +80,26 @@ export const getAppointments = async (req, res) => {
     const { doctorId, mobile, status, search = "", limit: limitRaw = 50, page: pageRaw = 1, patientClerkId, createdBy } = req.query;
     const limit = Math.min(200, Math.max(1, parseInt(limitRaw, 10) || 50));
     const page = Math.max(1, parseInt(pageRaw, 10) || 1);
-    const skip = (page - 1) * limit;
+    const offset = (page - 1) * limit;
 
-    const filter = {};
-    if (doctorId) filter.doctorId = doctorId;
-    if (mobile) filter.mobile = mobile;
-    if (status) filter.status = status;
-    if (patientClerkId) filter.createdBy = patientClerkId;
-    if (createdBy) filter.createdBy = createdBy;
+    const conditions = [];
+    const params = [];
+    if (doctorId) { conditions.push("doctorId = ?"); params.push(doctorId); }
+    if (mobile) { conditions.push("mobile = ?"); params.push(mobile); }
+    if (status) { conditions.push("status = ?"); params.push(status); }
+    if (patientClerkId) { conditions.push("createdBy = ?"); params.push(patientClerkId); }
+    if (createdBy) { conditions.push("createdBy = ?"); params.push(createdBy); }
     if (search) {
-      const re = new RegExp(search, "i");
-      filter.$or = [{ patientName: re }, { mobile: re }, { notes: re }];
+      conditions.push("(patientName LIKE ? OR mobile LIKE ?)");
+      params.push(`%${search}%`, `%${search}%`);
     }
 
-    const items = await Appointment.find(filter)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate("doctorId", "name specialization owner imageUrl image")
-      .lean();
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = await query(`SELECT * FROM appointments ${where} ORDER BY createdAt DESC LIMIT ? OFFSET ?`, [...params, limit, offset]);
+    const [countRes] = await pool.execute(`SELECT COUNT(*) AS total FROM appointments ${where}`, params);
+    const total = countRes[0].total;
 
-    const total = await Appointment.countDocuments(filter);
-
+    const items = await mergeMany(rows);
     return res.json({ success: true, appointments: items, meta: { page, limit, total, count: items.length } });
   } catch (err) {
     console.error("getAppointments:", err);
@@ -81,8 +110,9 @@ export const getAppointments = async (req, res) => {
 export const getAppointmentById = async (req, res) => {
   try {
     const { id } = req.params;
-    const appt = await Appointment.findById(id).populate("doctorId", "name specialization owner imageUrl image").lean();
-    if (!appt) return res.status(404).json({ success: false, message: "Appointment not found" });
+    const row = await queryOne("SELECT * FROM appointments WHERE id = ?", [id]);
+    if (!row) return res.status(404).json({ success: false, message: "Appointment not found" });
+    const appt = await mergeWithMeta(row);
     return res.json({ success: true, appointment: appt });
   } catch (err) {
     console.error("getAppointmentById:", err);
@@ -96,21 +126,21 @@ export const getAppointmentsByPatient = async (req, res) => {
     const clerkUserId = req.auth?.userId || null;
     const resolvedCreatedBy = queryCreatedBy || clerkUserId || null;
 
-    console.log("resolvedCreatedBy (query or req.auth.userId):", resolvedCreatedBy);
-
     if (!resolvedCreatedBy && !req.query.mobile) {
       return res.status(401).json({
         success: false,
-        message:
-          "Authentication required for /me (no Clerk user detected on server). Try passing ?createdBy=<id> to debug or check Authorization header forwarding.",
+        message: "Authentication required for /me",
       });
     }
 
-    const filter = {};
-    if (resolvedCreatedBy) filter.createdBy = resolvedCreatedBy;
-    if (req.query.mobile) filter.mobile = req.query.mobile;
+    const conditions = [];
+    const params = [];
+    if (resolvedCreatedBy) { conditions.push("createdBy = ?"); params.push(resolvedCreatedBy); }
+    if (req.query.mobile) { conditions.push("mobile = ?"); params.push(req.query.mobile); }
 
-    const appointments = await Appointment.find(filter).sort({ date: 1, time: 1 }).lean();
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = await query(`SELECT * FROM appointments ${where} ORDER BY appointmentDate ASC, appointmentTime ASC`, params);
+    const appointments = await mergeMany(rows);
     return res.json({ success: true, appointments });
   } catch (err) {
     console.error("Error in getAppointmentsByPatient:", err);
@@ -133,7 +163,6 @@ export const createAppointment = async (req, res) => {
       fee,
       fees,
       notes = "",
-      email,
       paymentMethod,
       owner: ownerFromBody = null,
       doctorName: doctorNameFromBody,
@@ -155,14 +184,10 @@ export const createAppointment = async (req, res) => {
     }
 
     // Duplicate booking prevention
-    const existingBooking = await Appointment.findOne({
-      doctorId,
-      createdBy: clerkUserId,
-      date: String(date),
-      time: String(time),
-      status: { $ne: "Canceled" },
-    }).lean();
-
+    const existingBooking = await queryOne(
+      "SELECT id FROM appointments WHERE doctorId = ? AND createdBy = ? AND appointmentDate = ? AND appointmentTime = ? AND status != 'Canceled'",
+      [doctorId, clerkUserId, String(date), String(time)]
+    );
     if (existingBooking) {
       return res.status(409).json({
         success: false,
@@ -170,222 +195,86 @@ export const createAppointment = async (req, res) => {
       });
     }
 
-    // Fetch doctor as source-of-truth
-    let doctor = null;
-    try {
-      doctor = await Doctor.findById(doctorId).lean();
-    } catch (e) {
-      console.warn("Doctor lookup failed:", e?.message || e);
-    }
+    // Fetch doctor from MySQL
+    const doctor = await queryOne("SELECT * FROM doctors WHERE id = ?", [doctorId]);
     if (!doctor) return res.status(404).json({ success: false, message: "Doctor not found" });
 
-    // Resolve owner, names, images, etc.
-    let resolvedOwner = ownerFromBody || doctor.owner || null;
-    if (!resolvedOwner) resolvedOwner = MAJOR_ADMIN_ID || String(doctorId);
-
+    let resolvedOwner = ownerFromBody || MAJOR_ADMIN_ID || doctorId;
     const doctorName = (doctor.name && String(doctor.name).trim()) || (doctorNameFromBody && String(doctorNameFromBody).trim()) || "";
-    const speciality =
-      (doctor.specialization && String(doctor.specialization).trim()) ||
-      (doctor.speciality && String(doctor.speciality).trim()) ||
-      (specialityFromBody && String(specialityFromBody).trim()) ||
-      "";
+    const speciality = (doctor.specialization && String(doctor.specialization).trim()) || (specialityFromBody && String(specialityFromBody).trim()) || "";
+    const doctorImageUrl = (doctor.imageUrl && String(doctor.imageUrl).trim()) || (doctorImageUrlFromBody && String(doctorImageUrlFromBody).trim()) || "";
+    const doctorImagePublicId = (doctor.imagePublicId && String(doctor.imagePublicId).trim()) || (doctorImagePublicIdFromBody && String(doctorImagePublicIdFromBody).trim()) || "";
 
-    const doctorImageUrl =
-      (doctor.imageUrl && String(doctor.imageUrl).trim()) ||
-      (doctor.image && String(doctor.image).trim()) ||
-      (doctor.avatarUrl && String(doctor.avatarUrl).trim()) ||
-      (doctor.profileImage && doctor.profileImage.url && String(doctor.profileImage.url).trim()) ||
-      (doctorImageUrlFromBody && String(doctorImageUrlFromBody).trim()) ||
-      "";
+    const id = newId();
 
-    const doctorImagePublicId =
-      (doctor.imagePublicId && String(doctor.imagePublicId).trim()) ||
-      (doctor.profileImage && doctor.profileImage.publicId && String(doctor.profileImage.publicId).trim()) ||
-      (doctorImagePublicIdFromBody && String(doctorImagePublicIdFromBody).trim()) ||
-      "";
+    const method = paymentMethod === "Cash" ? "Cash" : "Online";
+    const isFreePay = numericFee === 0;
 
-    const doctorImage = { url: doctorImageUrl, publicId: doctorImagePublicId };
-
-    const base = {
-      doctorId: String(doctor._id || doctorId),
-      doctorName,
-      speciality,
-      doctorImage,
+    // Insert structured data into MySQL
+    await insertRow("appointments", {
+      id,
+      owner: resolvedOwner,
+      createdBy: clerkUserId,
       patientName: String(patientName).trim(),
       mobile: String(mobile).trim(),
-      age: age ? Number(age) : undefined,
+      age: age ? Number(age) : null,
       gender: gender ? String(gender) : "",
-      date: String(date),
-      time: String(time),
+      doctorId: String(doctorId),
+      doctorName,
+      speciality,
+      doctorImageUrl,
+      doctorImagePublicId,
+      appointmentDate: String(date),
+      appointmentTime: String(time),
       fees: numericFee,
-      status: "Pending",
-      payment: { method: paymentMethod === "Cash" ? "Cash" : "Online", status: "Pending", amount: numericFee },
+      status: isFreePay ? "Confirmed" : "Pending",
+      paymentMethod: method,
+      paymentStatus: isFreePay ? "Paid" : "Pending",
+      paymentAmount: numericFee,
+      paidAt: isFreePay ? toMySQLDatetime(new Date()) : null,
+    });
+
+    // Insert semi-structured data into MongoDB
+    await AppointmentMeta.create({
+      appointmentId: id,
       notes: notes || "",
-      createdBy: clerkUserId,
-      owner: resolvedOwner,
-      sessionId: null,
-    };
+      paymentMeta: {},
+    });
 
-    // Free appointment
-    if (numericFee === 0) {
-      const created = await Appointment.create({
-        ...base,
-        status: "Confirmed",
-        payment: { method: base.payment.method, status: "Paid", amount: 0 },
-        paidAt: new Date(),
-      });
-      return res.status(201).json({ success: true, appointment: created, checkoutUrl: null });
-    }
-
-    // Cash payment
-    if (paymentMethod === "Cash") {
-      const created = await Appointment.create({
-        ...base,
-        status: "Pending",
-        payment: { method: "Cash", status: "Pending", amount: numericFee },
-      });
-      return res.status(201).json({ success: true, appointment: created, checkoutUrl: null });
-    }
-
-    // Online: Stripe
-    if (!stripe) return res.status(500).json({ success: false, message: "Stripe not configured on server" });
-
-    const frontBase = buildFrontendBase(req);
-    if (!frontBase) {
-      return res.status(500).json({ success: false, message: "Frontend URL could not be determined. Set FRONTEND_URL or send Origin header." });
-    }
-
-    const successUrl = `${frontBase}/appointment/success?session_id={CHECKOUT_SESSION_ID}`;
-    const cancelUrl = `${frontBase}/appointment/cancel`;
-
-    let session;
-    try {
-      session = await stripe.checkout.sessions.create({
-        payment_method_types: ["card"],
-        mode: "payment",
-        customer_email: email || undefined,
-        line_items: [
-          {
-            price_data: {
-              currency: "inr",
-              product_data: { name: `Appointment - ${String(patientName).slice(0, 40)}` },
-              unit_amount: Math.round(numericFee * 100),
-            },
-            quantity: 1,
-          },
-        ],
-        success_url: successUrl,
-        cancel_url: cancelUrl,
-        metadata: {
-          doctorId: String(doctorId),
-          doctorName: doctorName || "",
-          speciality: speciality || "",
-          patientName: base.patientName,
-          mobile: base.mobile,
-          clerkUserId: clerkUserId || "",
-        },
-      });
-    } catch (stripeErr) {
-      console.error("Stripe create session error:", stripeErr);
-      const message = stripeErr?.raw?.message || stripeErr?.message || "Stripe error";
-      return res.status(502).json({ success: false, message: `Payment provider error: ${message}` });
-    }
-
-    try {
-      const created = await Appointment.create({
-        ...base,
-        sessionId: session.id,
-        payment: { ...base.payment, providerId: session.payment_intent || session.paymentIntent || null },
-        status: "Pending",
-      });
-      return res.status(201).json({ success: true, appointment: created, checkoutUrl: session.url || null });
-    } catch (dbErr) {
-      console.error("DB error saving appointment after stripe session:", dbErr);
-      return res.status(500).json({ success: false, message: "Failed to create appointment record" });
-    }
+    const row = await queryOne("SELECT * FROM appointments WHERE id = ?", [id]);
+    const appt = await mergeWithMeta(row);
+    return res.status(201).json({ success: true, appointment: appt, checkoutUrl: null });
   } catch (err) {
     console.error("createAppointment unexpected:", err);
     return res.status(500).json({ success: false, message: "Server error" });
   }
 };
 
-/* ---------------- confirm payment ---------------- */
+/* ---------------- confirm payment (cash/manual) ---------------- */
 
 export const confirmPayment = async (req, res) => {
   try {
-    const { session_id } = req.query;
-    if (!session_id) return res.status(400).json({ success: false, message: "session_id is required" });
-    if (!stripe) return res.status(500).json({ success: false, message: "Stripe not configured" });
+    const { session_id, appointment_id } = req.query;
+    const id = appointment_id || session_id;
+    if (!id) return res.status(400).json({ success: false, message: "appointment_id or session_id is required" });
 
-    let session;
-    try {
-      session = await stripe.checkout.sessions.retrieve(session_id);
-    } catch (err) {
-      console.error("Stripe retrieve session error:", err);
-      return res.status(404).json({ success: false, message: "Stripe session not found" });
+    // Try by id first, then by sessionId
+    let row = await queryOne("SELECT * FROM appointments WHERE id = ?", [id]);
+    if (!row) {
+      row = await queryOne("SELECT * FROM appointments WHERE sessionId = ?", [id]);
     }
-    if (!session) return res.status(404).json({ success: false, message: "Invalid session" });
+    if (!row) return res.status(404).json({ success: false, message: "Appointment not found" });
 
-    if (session.payment_status !== "paid") {
-      return res.status(400).json({ success: false, message: "Payment not completed" });
-    }
-
-    // Try match by sessionId first
-    let appt = await Appointment.findOneAndUpdate(
-      { sessionId: session_id },
-      {
-        "payment.status": "Paid",
-        "payment.providerId": session.payment_intent || session.payment_intent_id || null,
+    if (row.paymentStatus !== "Paid") {
+      await updateRow("appointments", row.id, {
+        paymentStatus: "Paid",
         status: "Confirmed",
-        paidAt: new Date(),
-      },
-      { new: true }
-    );
-
-    // fallback: try match via metadata (doctorId + mobile + patientName)
-    if (!appt) {
-      const meta = session.metadata || {};
-      if (meta.doctorId && meta.mobile && meta.patientName) {
-        appt = await Appointment.findOneAndUpdate(
-          {
-            doctorId: meta.doctorId,
-            mobile: meta.mobile,
-            patientName: meta.patientName,
-            fees: Math.round((session.amount_total || 0) / 100) || undefined,
-          },
-          {
-            "payment.status": "Paid",
-            "payment.providerId": session.payment_intent || null,
-            status: "Confirmed",
-            paidAt: new Date(),
-            sessionId: session_id,
-          },
-          { new: true }
-        );
-      }
+        paidAt: toMySQLDatetime(new Date()),
+      });
     }
 
-    // last attempt: find appointment created in last 15 minutes with matching amount
-    if (!appt) {
-      const amount = Math.round((session.amount_total || 0) / 100);
-      const fifteenAgo = new Date(Date.now() - 1000 * 60 * 15);
-      appt = await Appointment.findOneAndUpdate(
-        { fees: amount, createdAt: { $gte: fifteenAgo } },
-        {
-          "payment.status": "Paid",
-          "payment.providerId": session.payment_intent || null,
-          status: "Confirmed",
-          paidAt: new Date(),
-          sessionId: session_id,
-        },
-        { new: true }
-      );
-    }
-
-    if (!appt) {
-      return res.status(404).json({ success: false, message: "Appointment not found for this payment session" });
-    }
-
+    const updated = await queryOne("SELECT * FROM appointments WHERE id = ?", [row.id]);
+    const appt = await mergeWithMeta(updated);
     return res.json({ success: true, appointment: appt });
   } catch (err) {
     console.error("confirmPayment:", err);
@@ -400,33 +289,44 @@ export const updateAppointment = async (req, res) => {
     const { id } = req.params;
     const body = req.body || {};
 
-    const appt = await Appointment.findById(id);
-    if (!appt) return res.status(404).json({ success: false, message: "Appointment not found" });
+    const row = await queryOne("SELECT * FROM appointments WHERE id = ?", [id]);
+    if (!row) return res.status(404).json({ success: false, message: "Appointment not found" });
 
-    const terminal = appt.status === "Completed" || appt.status === "Canceled";
-    if (terminal && body.status && body.status !== appt.status) {
+    const terminal = row.status === "Completed" || row.status === "Canceled";
+    if (terminal && body.status && body.status !== row.status) {
       return res.status(400).json({ success: false, message: "Cannot change status of a completed/canceled appointment" });
     }
 
-    const update = {};
-    if (body.status) update.status = body.status;
-    if (body.notes !== undefined) update.notes = body.notes;
+    const mysqlUpdate = {};
+    if (body.status) mysqlUpdate.status = body.status;
 
     if (body.date && body.time) {
-      if (appt.status === "Completed" || appt.status === "Canceled") {
+      if (row.status === "Completed" || row.status === "Canceled") {
         return res.status(400).json({ success: false, message: "Cannot reschedule completed/canceled appointment" });
       }
-      update.date = body.date;
-      update.time = body.time;
-      update.status = "Rescheduled";
-      update.rescheduledTo = { date: body.date, time: body.time };
+      mysqlUpdate.appointmentDate = body.date;
+      mysqlUpdate.appointmentTime = body.time;
+      mysqlUpdate.status = "Rescheduled";
+      mysqlUpdate.rescheduledDate = body.date;
+      mysqlUpdate.rescheduledTime = body.time;
     }
 
-    const updated = await Appointment.findByIdAndUpdate(id, update, { new: true, runValidators: true })
-      .populate({ path: "doctorId", select: "name imageUrl" })
-      .lean();
+    if (Object.keys(mysqlUpdate).length > 0) {
+      await updateRow("appointments", id, mysqlUpdate);
+    }
 
-    return res.json({ success: true, appointment: updated });
+    // Update MongoDB meta for notes/audit
+    if (body.notes !== undefined) {
+      await AppointmentMeta.findOneAndUpdate(
+        { appointmentId: id },
+        { notes: body.notes },
+        { upsert: true }
+      );
+    }
+
+    const updated = await queryOne("SELECT * FROM appointments WHERE id = ?", [id]);
+    const appt = await mergeWithMeta(updated);
+    return res.json({ success: true, appointment: appt });
   } catch (err) {
     console.error("updateAppointment:", err);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -436,11 +336,12 @@ export const updateAppointment = async (req, res) => {
 export const cancelAppointment = async (req, res) => {
   try {
     const { id } = req.params;
-    const appt = await Appointment.findById(id);
-    if (!appt) return res.status(404).json({ success: false, message: "Appointment not found" });
+    const row = await queryOne("SELECT id FROM appointments WHERE id = ?", [id]);
+    if (!row) return res.status(404).json({ success: false, message: "Appointment not found" });
 
-    appt.status = "Canceled";
-    await appt.save();
+    await updateRow("appointments", id, { status: "Canceled" });
+    const updated = await queryOne("SELECT * FROM appointments WHERE id = ?", [id]);
+    const appt = await mergeWithMeta(updated);
     return res.json({ success: true, appointment: appt });
   } catch (err) {
     console.error("cancelAppointment:", err);
@@ -450,13 +351,19 @@ export const cancelAppointment = async (req, res) => {
 
 export const getStats = async (req, res) => {
   try {
-    const total = await Appointment.countDocuments();
-    const paidAgg = await Appointment.aggregate([{ $match: { "payment.status": "Paid" } }, { $group: { _id: null, total: { $sum: "$fees" } } }]);
-    const revenue = (paidAgg[0] && paidAgg[0].total) || 0;
+    const [totalRes] = await pool.execute("SELECT COUNT(*) AS total FROM appointments");
+    const total = totalRes[0].total;
+
+    const [revenueRes] = await pool.execute("SELECT COALESCE(SUM(fees),0) AS revenue FROM appointments WHERE paymentStatus = 'Paid'");
+    const revenue = parseFloat(revenueRes[0].revenue) || 0;
 
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-    const recent = await Appointment.countDocuments({ createdAt: { $gte: sevenDaysAgo } });
+    const [recentRes] = await pool.execute(
+      "SELECT COUNT(*) AS recent FROM appointments WHERE createdAt >= ?",
+      [toMySQLDatetime(sevenDaysAgo)]
+    );
+    const recent = recentRes[0].recent;
 
     return res.json({ success: true, stats: { total, revenue, recentLast7Days: recent } });
   } catch (err) {
@@ -473,24 +380,23 @@ export const getAppointmentsByDoctor = async (req, res) => {
     const { mobile, status, search = "", limit: limitRaw = 50, page: pageRaw = 1 } = req.query;
     const limit = Math.min(200, Math.max(1, parseInt(limitRaw, 10) || 50));
     const page = Math.max(1, parseInt(pageRaw, 10) || 1);
-    const skip = (page - 1) * limit;
+    const offset = (page - 1) * limit;
 
-    const filter = { doctorId };
-    if (mobile) filter.mobile = mobile;
-    if (status) filter.status = status;
+    const conditions = ["doctorId = ?"];
+    const params = [doctorId];
+    if (mobile) { conditions.push("mobile = ?"); params.push(mobile); }
+    if (status) { conditions.push("status = ?"); params.push(status); }
     if (search) {
-      const re = new RegExp(search, "i");
-      filter.$or = [{ patientName: re }, { mobile: re }, { notes: re }];
+      conditions.push("(patientName LIKE ? OR mobile LIKE ?)");
+      params.push(`%${search}%`, `%${search}%`);
     }
 
-    const items = await Appointment.find(filter)
-      .sort({ date: 1, time: 1 })
-      .skip(skip)
-      .limit(limit)
-      .populate("doctorId", "name specialization owner imageUrl image")
-      .lean();
+    const where = `WHERE ${conditions.join(" AND ")}`;
+    const rows = await query(`SELECT * FROM appointments ${where} ORDER BY appointmentDate ASC, appointmentTime ASC LIMIT ? OFFSET ?`, [...params, limit, offset]);
+    const [countRes] = await pool.execute(`SELECT COUNT(*) AS total FROM appointments ${where}`, params);
+    const total = countRes[0].total;
 
-    const total = await Appointment.countDocuments(filter);
+    const items = await mergeMany(rows);
     return res.json({ success: true, appointments: items, meta: { page, limit, total, count: items.length } });
   } catch (err) {
     console.error("getAppointmentsByDoctor:", err);

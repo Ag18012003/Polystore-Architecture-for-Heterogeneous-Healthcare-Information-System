@@ -1,0 +1,37 @@
+-- ServiceAppointment table: stores structured service appointment data in MySQL
+CREATE TABLE IF NOT EXISTS service_appointments (
+  id VARCHAR(36) PRIMARY KEY,
+  createdBy VARCHAR(255) DEFAULT NULL,
+  patientName VARCHAR(255) NOT NULL,
+  mobile VARCHAR(50) NOT NULL,
+  age INT DEFAULT NULL,
+  gender VARCHAR(50) DEFAULT '',
+  serviceId VARCHAR(36) NOT NULL,
+  serviceName VARCHAR(255) NOT NULL,
+  serviceImageUrl TEXT DEFAULT NULL,
+  serviceImagePublicId VARCHAR(255) DEFAULT NULL,
+  fees DECIMAL(10,2) NOT NULL,
+  appointmentDate VARCHAR(20) NOT NULL,
+  hour INT NOT NULL,
+  minute INT NOT NULL,
+  ampm ENUM('AM','PM') NOT NULL,
+  status ENUM('Pending','Confirmed','Rescheduled','Completed','Canceled') DEFAULT 'Pending',
+  rescheduledDate VARCHAR(20) DEFAULT NULL,
+  rescheduledHour INT DEFAULT NULL,
+  rescheduledMinute INT DEFAULT NULL,
+  rescheduledAmpm ENUM('AM','PM') DEFAULT NULL,
+  paymentMethod ENUM('Cash','Online') DEFAULT 'Cash',
+  paymentStatus ENUM('Pending','Paid','Failed','Refunded','Canceled') DEFAULT 'Pending',
+  paymentAmount DECIMAL(10,2) DEFAULT 0,
+  paymentProviderId VARCHAR(255) DEFAULT NULL,
+  paymentSessionId VARCHAR(255) DEFAULT NULL,
+  paidAt DATETIME DEFAULT NULL,
+  createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_svcappt_service (serviceId),
+  INDEX idx_svcappt_created_by (createdBy),
+  INDEX idx_svcappt_session (paymentSessionId),
+  FOREIGN KEY (serviceId) REFERENCES services(id) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Semi-structured service appointment data (notes, paymentMeta, auditLog) is stored in MongoDB (ServiceAppointmentMeta collection)

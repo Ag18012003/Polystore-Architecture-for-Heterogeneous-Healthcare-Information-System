@@ -1,64 +1,49 @@
 // controllers/doctorController.js
+// Polystore: structured data → MySQL, semi-structured data → MongoDB (DoctorMeta)
 import jwt from "jsonwebtoken";
-import Doctor from "../models/Doctor.js";
+import pool from "../config/mysql.js";
+import DoctorMeta from "../models/mongodb/DoctorMeta.js";
 import { uploadToCloudinary, deleteFromCloudinary } from "../utils/cloudinary.js";
+import {
+  newId,
+  query,
+  queryOne,
+  insertRow,
+  updateRow,
+  deleteRow,
+  mapDoctorRow,
+} from "../utils/queryHelpers.js";
 
 /* ---------------- Helpers ---------------- */
-
-const parseTimeToMinutes = (t = "") => {
-  const [time = "0:00", ampm = ""] = (t || "").split(" ");
-  const [hh = 0, mm = 0] = time.split(":").map(Number);
-  let h = hh % 12;
-  if ((ampm || "").toUpperCase() === "PM") h += 12;
-  return h * 60 + (mm || 0);
-};
-
-function dedupeAndSortSchedule(schedule = {}) {
-  const out = {};
-  Object.entries(schedule).forEach(([date, slots]) => {
-    if (!Array.isArray(slots)) return;
-    const uniq = Array.from(new Set(slots));
-    uniq.sort((a, b) => parseTimeToMinutes(a) - parseTimeToMinutes(b));
-    out[date] = uniq;
-  });
-  return out;
-}
 
 function parseScheduleInput(s) {
   if (!s) return {};
   if (typeof s === "string") {
-    try {
-      s = JSON.parse(s);
-    } catch {
-      return {};
-    }
+    try { s = JSON.parse(s); } catch { return {}; }
   }
-  return dedupeAndSortSchedule(s || {});
+  if (typeof s !== "object" || Array.isArray(s)) return {};
+  const out = {};
+  Object.entries(s).forEach(([date, slots]) => {
+    if (!Array.isArray(slots)) return;
+    out[date] = Array.from(new Set(slots));
+  });
+  return out;
 }
 
-function normalizeDocForClient(raw = {}) {
-  const doc = { ...raw };
-
-  // convert Mongoose Map to plain object
-  if (doc.schedule && typeof doc.schedule.forEach === "function") {
-    const obj = {};
-    doc.schedule.forEach((val, key) => {
-      obj[key] = Array.isArray(val) ? val : [];
-    });
-    doc.schedule = obj;
-  } else if (!doc.schedule || typeof doc.schedule !== "object") {
-    doc.schedule = {};
+function mergeDoctorWithMeta(row, meta) {
+  const base = mapDoctorRow(row);
+  if (!base) return null;
+  if (meta) {
+    base.about = meta.aboutSection || "";
+    base.schedule = meta.schedule || {};
+    base.achievements = meta.achievements || [];
+    base.articleRefs = meta.articleRefs || [];
+    base.testimonials = meta.testimonials || [];
   }
-
-  doc.availability = doc.availability === undefined ? "Available" : doc.availability;
-  doc.patients = doc.patients ?? "";
-  doc.rating = doc.rating ?? 0;
-  doc.fee = doc.fee ?? doc.fees ?? 0;
-
-  return doc;
+  return base;
 }
 
-/* ---------------- Controller ---------------- */
+/* ---------------- Controllers ---------------- */
 
 export async function createDoctor(req, res) {
   try {
@@ -67,8 +52,9 @@ export async function createDoctor(req, res) {
       return res.status(400).json({ success: false, message: "email, password and name are required" });
     }
 
-    const emailLC = (body.email || "").toLowerCase();
-    if (await Doctor.findOne({ email: emailLC })) {
+    const emailLC = body.email.toLowerCase();
+    const existing = await queryOne("SELECT id FROM doctors WHERE email = ?", [emailLC]);
+    if (existing) {
       return res.status(409).json({ success: false, message: "Email already in use" });
     }
 
@@ -80,39 +66,47 @@ export async function createDoctor(req, res) {
       imagePublicId = uploaded?.public_id || uploaded?.publicId || imagePublicId;
     }
 
-    const schedule = parseScheduleInput(body.schedule);
+    const id = newId();
 
-    const doc = new Doctor({
+    // Insert structured fields into MySQL
+    await insertRow("doctors", {
+      id,
       email: emailLC,
       password: body.password,
       name: body.name,
       specialization: body.specialization || "",
-      imageUrl,
-      imagePublicId,
-      availability: body.availability || "Available",
+      imageUrl: imageUrl || null,
+      imagePublicId: imagePublicId || null,
       experience: body.experience || "",
       qualifications: body.qualifications || "",
       location: body.location || "",
-      about: body.about || "",
       fee: body.fee !== undefined ? Number(body.fee) : 0,
-      schedule,
+      availability: body.availability || "Available",
+      rating: body.rating !== undefined ? Number(body.rating) : 0,
       success: body.success || "",
       patients: body.patients || "",
-      rating: body.rating !== undefined ? Number(body.rating) : 0,
     });
 
-    await doc.save();
+    // Insert semi-structured fields into MongoDB
+    const schedule = parseScheduleInput(body.schedule);
+    await DoctorMeta.create({
+      doctorId: id,
+      aboutSection: body.about || "",
+      achievements: [],
+      articleRefs: [],
+      testimonials: [],
+      schedule,
+    });
+
+    const row = await queryOne("SELECT * FROM doctors WHERE id = ?", [id]);
+    const meta = await DoctorMeta.findOne({ doctorId: id }).lean();
+    const out = mergeDoctorWithMeta(row, meta);
 
     const secret = process.env.JWT_SECRET;
     if (!secret) {
-      console.warn("JWT_SECRET is not set");
       return res.status(500).json({ success: false, message: "Server misconfiguration" });
     }
-
-    const token = jwt.sign({ id: doc._id.toString(), email: doc.email, role: "doctor" }, secret, { expiresIn: "7d" });
-
-    const out = normalizeDocForClient(doc.toObject());
-    delete out.password;
+    const token = jwt.sign({ id, email: emailLC, role: "doctor" }, secret, { expiresIn: "7d" });
 
     return res.status(201).json({ success: true, data: out, token });
   } catch (err) {
@@ -126,80 +120,49 @@ export const getDoctors = async (req, res) => {
     const { q = "", limit: limitRaw = 200, page: pageRaw = 1 } = req.query;
     const limit = Math.min(500, Math.max(1, parseInt(limitRaw, 10) || 200));
     const page = Math.max(1, parseInt(pageRaw, 10) || 1);
-    const skip = (page - 1) * limit;
+    const offset = (page - 1) * limit;
 
-    const match = {};
-    if (q && typeof q === "string" && q.trim()) {
-      const re = new RegExp(q.trim(), "i");
-      match.$or = [{ name: re }, { specialization: re }, { speciality: re }, { email: re }];
+    let whereSql = "";
+    const params = [];
+    if (q && q.trim()) {
+      whereSql = "WHERE (d.name LIKE ? OR d.specialization LIKE ? OR d.email LIKE ?)";
+      params.push(`%${q.trim()}%`, `%${q.trim()}%`, `%${q.trim()}%`);
     }
 
-    const docs = await Doctor.aggregate([
-      { $match: match },
-      {
-        $lookup: {
-          from: "appointments",
-          localField: "_id",
-          foreignField: "doctorId",
-          as: "appointments",
-        },
-      },
-      {
-        $addFields: {
-          appointmentsTotal: { $size: "$appointments" },
-          appointmentsCompleted: {
-            $size: {
-              $filter: { input: "$appointments", as: "a", cond: { $in: ["$$a.status", ["Confirmed", "Completed"]] } }
-            }
-          },
-          appointmentsCanceled: {
-            $size: {
-              $filter: { input: "$appointments", as: "a", cond: { $eq: ["$$a.status", "Canceled"] } }
-            }
-          },
-          earnings: {
-            $sum: {
-              $map: {
-                input: {
-                  $filter: { input: "$appointments", as: "a", cond: { $in: ["$$a.status", ["Confirmed", "Completed"]] } }
-                },
-                as: "p",
-                in: { $ifNull: ["$$p.fees", 0] }
-              }
-            }
-          }
-        }
-      },
-      { $project: { appointments: 0 } },
-      { $sort: { name: 1 } },
-      { $skip: skip },
-      { $limit: limit }
-    ]);
+    const rows = await query(
+      `SELECT d.*,
+        (SELECT COUNT(*) FROM appointments a WHERE a.doctorId = d.id) AS appointmentsTotal,
+        (SELECT COUNT(*) FROM appointments a WHERE a.doctorId = d.id AND a.status IN ('Confirmed','Completed')) AS appointmentsCompleted,
+        (SELECT COUNT(*) FROM appointments a WHERE a.doctorId = d.id AND a.status = 'Canceled') AS appointmentsCanceled,
+        (SELECT COALESCE(SUM(a.fees),0) FROM appointments a WHERE a.doctorId = d.id AND a.status IN ('Confirmed','Completed')) AS earnings
+       FROM doctors d ${whereSql} ORDER BY d.name LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
 
-    const normalized = docs.map((d) => ({
-      _id: d._id,
-      id: d._id,
-      name: d.name || "",
-      specialization: d.specialization || d.speciality || "",
-      fee: d.fee ?? d.fees ?? d.consultationFee ?? 0,
-      imageUrl: d.imageUrl || d.image || d.avatar || null,
-      appointmentsTotal: d.appointmentsTotal || 0,
-      appointmentsCompleted: d.appointmentsCompleted || 0,
-      appointmentsCanceled: d.appointmentsCanceled || 0,
-      earnings: d.earnings || 0,
-      availability: d.availability ?? "Available",
-      schedule: (d.schedule && typeof d.schedule === "object") ? d.schedule : {},
-      patients: d.patients ?? "",
-      rating: d.rating ?? 0,
-      about: d.about ?? "",
-      experience: d.experience ?? "",
-      qualifications: d.qualifications ?? "",
-      location: d.location ?? "",
-      success: d.success ?? "",
-      raw: d,
-    }));
+    const [countResult] = await pool.execute(
+      `SELECT COUNT(*) AS total FROM doctors ${whereSql}`,
+      params
+    );
+    const total = countResult[0].total;
 
-    const total = await Doctor.countDocuments(match);
+    // Fetch all meta in one MongoDB query
+    const ids = rows.map((r) => r.id);
+    const metas = ids.length
+      ? await DoctorMeta.find({ doctorId: { $in: ids } }).lean()
+      : [];
+    const metaMap = {};
+    metas.forEach((m) => { metaMap[m.doctorId] = m; });
+
+    const normalized = rows.map((row) => {
+      const base = mergeDoctorWithMeta(row, metaMap[row.id]);
+      return {
+        ...base,
+        appointmentsTotal: row.appointmentsTotal || 0,
+        appointmentsCompleted: row.appointmentsCompleted || 0,
+        appointmentsCanceled: row.appointmentsCanceled || 0,
+        earnings: parseFloat(row.earnings) || 0,
+      };
+    });
 
     return res.json({ success: true, data: normalized, doctors: normalized, meta: { page, limit, total } });
   } catch (err) {
@@ -211,9 +174,12 @@ export const getDoctors = async (req, res) => {
 export async function getDoctorById(req, res) {
   try {
     const { id } = req.params;
-    const doc = await Doctor.findById(id).select("-password").lean();
-    if (!doc) return res.status(404).json({ success: false, message: "Doctor not found" });
-    return res.json({ success: true, data: normalizeDocForClient(doc) });
+    const row = await queryOne("SELECT * FROM doctors WHERE id = ?", [id]);
+    if (!row) return res.status(404).json({ success: false, message: "Doctor not found" });
+
+    const meta = await DoctorMeta.findOne({ doctorId: id }).lean();
+    const out = mergeDoctorWithMeta(row, meta);
+    return res.json({ success: true, data: out });
   } catch (err) {
     console.error("getDoctorById error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -229,40 +195,55 @@ export async function updateDoctor(req, res) {
       return res.status(403).json({ success: false, message: "Not authorized to update this doctor" });
     }
 
-    const existing = await Doctor.findById(id);
+    const existing = await queryOne("SELECT * FROM doctors WHERE id = ?", [id]);
     if (!existing) return res.status(404).json({ success: false, message: "Doctor not found" });
+
+    const mysqlUpdate = {};
 
     if (req.file?.path) {
       const uploaded = await uploadToCloudinary(req.file.path, "doctors");
       if (uploaded) {
-        const previousPublicId = existing.imagePublicId;
-        existing.imageUrl = uploaded.secure_url || uploaded.url || existing.imageUrl;
-        existing.imagePublicId = uploaded.public_id || uploaded.publicId || existing.imagePublicId;
-        if (previousPublicId && previousPublicId !== existing.imagePublicId) {
-          deleteFromCloudinary(previousPublicId).catch((e) => console.warn("deleteFromCloudinary warning:", e?.message || e));
+        if (existing.imagePublicId && existing.imagePublicId !== (uploaded.public_id || uploaded.publicId)) {
+          deleteFromCloudinary(existing.imagePublicId).catch((e) =>
+            console.warn("deleteFromCloudinary warning:", e?.message || e)
+          );
         }
+        mysqlUpdate.imageUrl = uploaded.secure_url || uploaded.url || existing.imageUrl;
+        mysqlUpdate.imagePublicId = uploaded.public_id || uploaded.publicId || existing.imagePublicId;
       }
     } else if (body.imageUrl) {
-      existing.imageUrl = body.imageUrl;
+      mysqlUpdate.imageUrl = body.imageUrl;
     }
 
-    if (body.schedule) existing.schedule = parseScheduleInput(body.schedule);
-
-    const updatable = ["name", "specialization", "experience", "qualifications", "location", "about", "fee", "availability", "success", "patients", "rating"];
-    updatable.forEach((k) => { if (body[k] !== undefined) existing[k] = body[k]; });
+    const structuredFields = ["name", "specialization", "experience", "qualifications", "location", "fee", "availability", "success", "patients", "rating"];
+    structuredFields.forEach((k) => { if (body[k] !== undefined) mysqlUpdate[k] = body[k]; });
 
     if (body.email && body.email !== existing.email) {
-      const other = await Doctor.findOne({ email: body.email.toLowerCase() });
-      if (other && other._id.toString() !== id) return res.status(409).json({ success: false, message: "Email already in use" });
-      existing.email = body.email.toLowerCase();
+      const other = await queryOne("SELECT id FROM doctors WHERE email = ? AND id != ?", [body.email.toLowerCase(), id]);
+      if (other) return res.status(409).json({ success: false, message: "Email already in use" });
+      mysqlUpdate.email = body.email.toLowerCase();
+    }
+    if (body.password) mysqlUpdate.password = body.password;
+
+    if (Object.keys(mysqlUpdate).length > 0) {
+      await updateRow("doctors", id, mysqlUpdate);
     }
 
-    if (body.password) existing.password = body.password;
+    // Update MongoDB meta (semi-structured)
+    const metaUpdate = {};
+    if (body.about !== undefined) metaUpdate.aboutSection = body.about;
+    if (body.schedule !== undefined) metaUpdate.schedule = parseScheduleInput(body.schedule);
+    if (body.achievements !== undefined) metaUpdate.achievements = body.achievements;
+    if (body.testimonials !== undefined) metaUpdate.testimonials = body.testimonials;
+    if (body.articleRefs !== undefined) metaUpdate.articleRefs = body.articleRefs;
 
-    await existing.save();
+    if (Object.keys(metaUpdate).length > 0) {
+      await DoctorMeta.findOneAndUpdate({ doctorId: id }, metaUpdate, { upsert: true, new: true });
+    }
 
-    const out = normalizeDocForClient(existing.toObject());
-    delete out.password;
+    const row = await queryOne("SELECT * FROM doctors WHERE id = ?", [id]);
+    const meta = await DoctorMeta.findOne({ doctorId: id }).lean();
+    const out = mergeDoctorWithMeta(row, meta);
     return res.json({ success: true, data: out });
   } catch (err) {
     console.error("updateDoctor error:", err);
@@ -273,18 +254,17 @@ export async function updateDoctor(req, res) {
 export async function deleteDoctor(req, res) {
   try {
     const { id } = req.params;
-    const existing = await Doctor.findById(id);
+    const existing = await queryOne("SELECT * FROM doctors WHERE id = ?", [id]);
     if (!existing) return res.status(404).json({ success: false, message: "Doctor not found" });
 
     if (existing.imagePublicId) {
-      try {
-        await deleteFromCloudinary(existing.imagePublicId);
-      } catch (e) {
+      try { await deleteFromCloudinary(existing.imagePublicId); } catch (e) {
         console.warn("deleteFromCloudinary warning:", e?.message || e);
       }
     }
 
-    await Doctor.findByIdAndDelete(id);
+    await deleteRow("doctors", id);
+    await DoctorMeta.deleteOne({ doctorId: id });
     return res.json({ success: true, message: "Doctor removed" });
   } catch (err) {
     console.error("deleteDoctor error:", err);
@@ -299,15 +279,15 @@ export async function toggleAvailability(req, res) {
       return res.status(403).json({ success: false, message: "Not authorized to change availability for this doctor" });
     }
 
-    const doc = await Doctor.findById(id);
-    if (!doc) return res.status(404).json({ success: false, message: "Doctor not found" });
+    const row = await queryOne("SELECT * FROM doctors WHERE id = ?", [id]);
+    if (!row) return res.status(404).json({ success: false, message: "Doctor not found" });
 
-    if (typeof doc.availability === "boolean") doc.availability = !doc.availability;
-    else doc.availability = doc.availability === "Available" ? "Unavailable" : "Available";
+    const newAvailability = row.availability === "Available" ? "Unavailable" : "Available";
+    await updateRow("doctors", id, { availability: newAvailability });
 
-    await doc.save();
-    const out = normalizeDocForClient(doc.toObject());
-    delete out.password;
+    const updated = await queryOne("SELECT * FROM doctors WHERE id = ?", [id]);
+    const meta = await DoctorMeta.findOne({ doctorId: id }).lean();
+    const out = mergeDoctorWithMeta(updated, meta);
     return res.json({ success: true, data: out });
   } catch (err) {
     console.error("toggleAvailability error:", err);
@@ -320,19 +300,18 @@ export async function doctorLogin(req, res) {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ success: false, message: "Email and password required" });
 
-    const doc = await Doctor.findOne({ email: email.toLowerCase() }).select("+password");
-    if (!doc) return res.status(401).json({ success: false, message: "Invalid credentials" });
+    const row = await queryOne("SELECT * FROM doctors WHERE email = ?", [email.toLowerCase()]);
+    if (!row) return res.status(401).json({ success: false, message: "Invalid credentials" });
 
-    // Direct comparison (NO bcrypt)
-    if (doc.password !== password) return res.status(401).json({ success: false, message: "Invalid credentials" });
+    if (row.password !== password) return res.status(401).json({ success: false, message: "Invalid credentials" });
 
     const secret = process.env.JWT_SECRET;
     if (!secret) return res.status(500).json({ success: false, message: "JWT_SECRET not configured" });
 
-    const token = jwt.sign({ id: doc._id.toString(), email: doc.email, role: "doctor" }, secret, { expiresIn: "7d" });
+    const token = jwt.sign({ id: row.id, email: row.email, role: "doctor" }, secret, { expiresIn: "7d" });
 
-    const out = doc.toObject();
-    delete out.password;
+    const meta = await DoctorMeta.findOne({ doctorId: row.id }).lean();
+    const out = mergeDoctorWithMeta(row, meta);
     return res.json({ success: true, token, data: out });
   } catch (err) {
     console.error("doctorLogin error:", err);
