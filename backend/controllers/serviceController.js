@@ -223,7 +223,8 @@ export async function updateService(req, res) {
               console.warn("Cloudinary delete failed:", e?.message || e);
             }
           }
-          fields.push("image_url = ?", "image_public_id = ?");
+          fields.push("image_url = ?");
+          fields.push("image_public_id = ?");
           vals.push(up.secure_url, up.public_id || null);
         }
       } catch (err) {

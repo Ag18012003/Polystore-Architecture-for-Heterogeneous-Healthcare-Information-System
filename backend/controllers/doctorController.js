@@ -314,7 +314,8 @@ export async function updateDoctor(req, res) {
       );
     }
 
-    fields.push("image_url = ?", "image_public_id = ?");
+    fields.push("image_url = ?");
+    fields.push("image_public_id = ?");
     vals.push(imageUrl, imagePublicId);
 
     if (body.email && body.email.toLowerCase() !== existing.email) {
