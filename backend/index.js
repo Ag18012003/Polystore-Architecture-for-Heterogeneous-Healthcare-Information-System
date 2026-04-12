@@ -43,23 +43,25 @@ app.use(clerkMiddleware());
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ limit: "20mb", extended: true }));
 
-// Database Connection
-connectDB();
-
-// Static uploads folder
-
-
-// Routes (unchanged)
+// Routes
 app.use("/api/appointments", appointmentRouter);
 app.use("/api/doctors", doctorRouter);
 app.use("/api/services", serviceRouter);
 app.use("/api/service-appointments", serviceAppointmentRouter);
 
 // Test route
-app.get('/', (req, res) => {
-    res.send('API Working ');
+app.get("/", (req, res) => {
+  res.send("API Working");
 });
 
-app.listen(port, () => {
-    console.log(`Server Started on http://localhost:${port}`);
-});
+// Database Connection – start server only after BOTH connections are ready
+connectDB()
+  .then(() => {
+    app.listen(port, () => {
+      console.log(`Server Started on http://localhost:${port}`);
+    });
+  })
+  .catch((err) => {
+    console.error("Failed to connect to databases:", err);
+    process.exit(1);
+  });

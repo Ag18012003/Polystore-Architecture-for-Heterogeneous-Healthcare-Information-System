@@ -46,8 +46,7 @@ const serviceAppointmentSchema = new mongoose.Schema(
        Service Info
        ========================= */
     serviceId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Service",
+      type: String, // MySQL service id (integer stored as string)
       required: true,
     },
 
