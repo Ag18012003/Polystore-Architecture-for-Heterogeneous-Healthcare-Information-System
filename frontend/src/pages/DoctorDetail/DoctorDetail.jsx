@@ -310,9 +310,9 @@ export default function DoctorDetail() {
         return;
       }
 
-      // If checkoutUrl is returned -> redirect to Stripe Checkout
+      // If checkoutUrl is returned -> redirect to payment checkout
       if (body.checkoutUrl) {
-        // redirect user to Stripe Checkout
+        // redirect user to payment checkout
         window.location.href = body.checkoutUrl;
         return;
       }

@@ -1,5 +1,17 @@
-import Service from "../models/Service.js";
+// controllers/serviceController.js
+// Polystore: structured data → MySQL, semi-structured data → MongoDB (ServiceMeta)
+import pool from "../config/mysql.js";
+import ServiceMeta from "../models/mongodb/ServiceMeta.js";
 import { uploadToCloudinary, deleteFromCloudinary } from "../utils/cloudinary.js";
+import {
+  newId,
+  query,
+  queryOne,
+  insertRow,
+  updateRow,
+  deleteRow,
+  mapServiceRow,
+} from "../utils/queryHelpers.js";
 
 /* -----------------------
    Helpers
@@ -13,47 +25,51 @@ const parseJsonArrayField = (field) => {
       if (Array.isArray(parsed)) return parsed;
       return typeof parsed === "string" ? [parsed] : [];
     } catch {
-      return field
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
+      return field.split(",").map((s) => s.trim()).filter(Boolean);
     }
   }
   return [];
 };
 
-// store date as plain YYYY-MM-DD + time-as-string
 function normalizeSlotsToMap(slotStrings = []) {
-  // return a map: { "2026-01-06": ["10:00 AM", "02:30 PM"] }
   const map = {};
   slotStrings.forEach((raw) => {
-    // parse your "DD Mon YYYY • HH:MM AM" format (or keep raw if you prefer)
     const m = raw.match(/^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s*•\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i);
     if (!m) {
-      // fallback: keep raw in an "unspecified" bucket
       map["unspecified"] = map["unspecified"] || [];
       map["unspecified"].push(raw);
       return;
     }
-    const [ , day, monShort, year, hour, minute, ampm ] = m;
+    const [, day, monShort, year, hour, minute, ampm] = m;
     const monthIdx = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-      .findIndex(x => x.toLowerCase() === monShort.toLowerCase());
+      .findIndex((x) => x.toLowerCase() === monShort.toLowerCase());
     const mm = String(monthIdx + 1).padStart(2, "0");
     const dd = String(Number(day)).padStart(2, "0");
-    const dateKey = `${year}-${mm}-${dd}`; // YYYY-MM-DD
-    const timeStr = `${String(Number(hour)).padStart(2,"0")}:${String(minute).padStart(2,"0")} ${ampm.toUpperCase()}`;
+    const dateKey = `${year}-${mm}-${dd}`;
+    const timeStr = `${String(Number(hour)).padStart(2, "0")}:${String(minute).padStart(2, "0")} ${ampm.toUpperCase()}`;
     map[dateKey] = map[dateKey] || [];
     map[dateKey].push(timeStr);
   });
   return map;
 }
 
-
 const sanitizePrice = (v) => Number(String(v ?? "0").replace(/[^\d.-]/g, "")) || 0;
 const parseAvailability = (v) => {
   const s = String(v ?? "available").toLowerCase();
-  return s === "available" || s === "true";
+  return s === "available" || s === "true" ? 1 : 0;
 };
+
+function mergeServiceWithMeta(row, meta) {
+  const base = mapServiceRow(row);
+  if (!base) return null;
+  if (meta) {
+    base.instructions = meta.instructions || [];
+    base.dates = meta.dates || [];
+    base.slots = meta.slots || {};
+    base.specialNotes = meta.specialNotes || "";
+  }
+  return base;
+}
 
 /* -----------------------
    CREATE
@@ -79,20 +95,33 @@ export async function createService(req, res) {
       }
     }
 
-    const service = new Service({
+    const id = newId();
+
+    // Insert structured fields into MySQL
+    await insertRow("services", {
+      id,
       name: b.name,
       about: b.about || "",
       shortDescription: b.shortDescription || "",
       price: numericPrice,
       available,
-      instructions,
-      slots,
       imageUrl,
       imagePublicId,
     });
 
-    const saved = await service.save();
-    return res.status(201).json({ success: true, data: saved, message: "Service created" });
+    // Insert semi-structured fields into MongoDB
+    await ServiceMeta.create({
+      serviceId: id,
+      instructions,
+      dates: parseJsonArrayField(b.dates),
+      slots,
+      specialNotes: b.specialNotes || "",
+    });
+
+    const row = await queryOne("SELECT * FROM services WHERE id = ?", [id]);
+    const meta = await ServiceMeta.findOne({ serviceId: id }).lean();
+    const result = mergeServiceWithMeta(row, meta);
+    return res.status(201).json({ success: true, data: result, message: "Service created" });
   } catch (err) {
     console.error("createService error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -104,7 +133,15 @@ export async function createService(req, res) {
    ----------------------- */
 export async function getServices(req, res) {
   try {
-    const list = await Service.find().sort({ createdAt: -1 }).lean();
+    const rows = await query("SELECT * FROM services ORDER BY createdAt DESC");
+    const ids = rows.map((r) => r.id);
+    const metas = ids.length
+      ? await ServiceMeta.find({ serviceId: { $in: ids } }).lean()
+      : [];
+    const metaMap = {};
+    metas.forEach((m) => { metaMap[m.serviceId] = m; });
+
+    const list = rows.map((row) => mergeServiceWithMeta(row, metaMap[row.id]));
     return res.status(200).json({ success: true, data: list });
   } catch (err) {
     console.error("getServices error:", err);
@@ -118,9 +155,10 @@ export async function getServices(req, res) {
 export async function getServiceById(req, res) {
   try {
     const { id } = req.params;
-    const service = await Service.findById(id).lean();
-    if (!service) return res.status(404).json({ success: false, message: "Service not found" });
-    return res.status(200).json({ success: true, data: service });
+    const row = await queryOne("SELECT * FROM services WHERE id = ?", [id]);
+    if (!row) return res.status(404).json({ success: false, message: "Service not found" });
+    const meta = await ServiceMeta.findOne({ serviceId: id }).lean();
+    return res.status(200).json({ success: true, data: mergeServiceWithMeta(row, meta) });
   } catch (err) {
     console.error("getServiceById error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -133,32 +171,28 @@ export async function getServiceById(req, res) {
 export async function updateService(req, res) {
   try {
     const { id } = req.params;
-    const existing = await Service.findById(id);
+    const existing = await queryOne("SELECT * FROM services WHERE id = ?", [id]);
     if (!existing) return res.status(404).json({ success: false, message: "Service not found" });
 
     const b = req.body || {};
-    const updateData = {};
+    const mysqlUpdate = {};
 
-    if (b.name !== undefined) updateData.name = b.name;
-    if (b.about !== undefined) updateData.about = b.about;
-    if (b.shortDescription !== undefined) updateData.shortDescription = b.shortDescription;
-    if (b.price !== undefined) updateData.price = sanitizePrice(b.price);
-    if (b.availability !== undefined) updateData.available = parseAvailability(b.availability);
-    if (b.instructions !== undefined) updateData.instructions = parseJsonArrayField(b.instructions);
-    if (b.slots !== undefined) updateData.slots = normalizeSlotsToMap(parseJsonArrayField(b.slots));
+    if (b.name !== undefined) mysqlUpdate.name = b.name;
+    if (b.about !== undefined) mysqlUpdate.about = b.about;
+    if (b.shortDescription !== undefined) mysqlUpdate.shortDescription = b.shortDescription;
+    if (b.price !== undefined) mysqlUpdate.price = sanitizePrice(b.price);
+    if (b.availability !== undefined) mysqlUpdate.available = parseAvailability(b.availability);
 
     if (req.file) {
       try {
         const up = await uploadToCloudinary(req.file.path, "services");
         if (up?.secure_url) {
-          updateData.imageUrl = up.secure_url;
-          updateData.imagePublicId = up.public_id || null;
+          mysqlUpdate.imageUrl = up.secure_url;
+          mysqlUpdate.imagePublicId = up.public_id || null;
           if (existing.imagePublicId) {
-            try {
-              await deleteFromCloudinary(existing.imagePublicId);
-            } catch (err) {
-              console.warn("Cloudinary delete failed:", err?.message || err);
-            }
+            deleteFromCloudinary(existing.imagePublicId).catch((err) =>
+              console.warn("Cloudinary delete failed:", err?.message || err)
+            );
           }
         }
       } catch (err) {
@@ -166,8 +200,24 @@ export async function updateService(req, res) {
       }
     }
 
-    const updated = await Service.findByIdAndUpdate(id, updateData, { new: true, runValidators: true });
-    return res.status(200).json({ success: true, data: updated, message: "Service updated" });
+    if (Object.keys(mysqlUpdate).length > 0) {
+      await updateRow("services", id, mysqlUpdate);
+    }
+
+    // Update MongoDB meta
+    const metaUpdate = {};
+    if (b.instructions !== undefined) metaUpdate.instructions = parseJsonArrayField(b.instructions);
+    if (b.slots !== undefined) metaUpdate.slots = normalizeSlotsToMap(parseJsonArrayField(b.slots));
+    if (b.dates !== undefined) metaUpdate.dates = parseJsonArrayField(b.dates);
+    if (b.specialNotes !== undefined) metaUpdate.specialNotes = b.specialNotes;
+
+    if (Object.keys(metaUpdate).length > 0) {
+      await ServiceMeta.findOneAndUpdate({ serviceId: id }, metaUpdate, { upsert: true, new: true });
+    }
+
+    const row = await queryOne("SELECT * FROM services WHERE id = ?", [id]);
+    const meta = await ServiceMeta.findOne({ serviceId: id }).lean();
+    return res.status(200).json({ success: true, data: mergeServiceWithMeta(row, meta), message: "Service updated" });
   } catch (err) {
     console.error("updateService error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -180,18 +230,17 @@ export async function updateService(req, res) {
 export async function deleteService(req, res) {
   try {
     const { id } = req.params;
-    const existing = await Service.findById(id);
+    const existing = await queryOne("SELECT * FROM services WHERE id = ?", [id]);
     if (!existing) return res.status(404).json({ success: false, message: "Service not found" });
 
     if (existing.imagePublicId) {
-      try {
-        await deleteFromCloudinary(existing.imagePublicId);
-      } catch (err) {
-        console.warn("failed to delete cloud image on service delete:", err?.message || err);
-      }
+      deleteFromCloudinary(existing.imagePublicId).catch((err) =>
+        console.warn("failed to delete cloud image on service delete:", err?.message || err)
+      );
     }
 
-    await existing.deleteOne();
+    await deleteRow("services", id);
+    await ServiceMeta.deleteOne({ serviceId: id });
     return res.status(200).json({ success: true, message: "Service deleted" });
   } catch (err) {
     console.error("deleteService error:", err);

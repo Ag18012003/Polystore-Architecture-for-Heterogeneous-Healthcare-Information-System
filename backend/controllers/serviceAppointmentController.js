@@ -1,11 +1,17 @@
 // controllers/serviceAppointmentController.js
-import ServiceAppointment from "../models/serviceAppointment.js";
-import Service from "../models/Service.js";
-import Stripe from "stripe";
+// Polystore: structured data → MySQL (service_appointments), semi-structured → MongoDB (ServiceAppointmentMeta)
+import pool from "../config/mysql.js";
+import ServiceAppointmentMeta from "../models/mongodb/ServiceAppointmentMeta.js";
 import { getAuth } from "@clerk/express";
-
-const stripeKey = process.env.STRIPE_SECRET_KEY || null;
-const stripe = stripeKey ? new Stripe(stripeKey, { apiVersion: "2022-11-15" }) : null;
+import {
+  newId,
+  query,
+  queryOne,
+  insertRow,
+  updateRow,
+  mapServiceAppointmentRow,
+  toMySQLDatetime,
+} from "../utils/queryHelpers.js";
 
 const safeNumber = (val) => {
   if (val === undefined || val === null || val === "") return null;
@@ -35,13 +41,6 @@ function parseTimeString(timeStr) {
   return { hour: hh, minute: mm, ampm: "AM" };
 }
 
-const buildFrontendBase = (req) => {
-  const env = process.env.FRONTEND_URL;
-  if (env) return env.replace(/\/$/, "");
-  const origin = req.get("origin") || req.get("referer") || null;
-  return origin ? origin.replace(/\/$/, "") : null;
-};
-
 function resolveClerkUserId(req) {
   try {
     const auth = req.auth || {};
@@ -56,6 +55,37 @@ function resolveClerkUserId(req) {
   } catch (e) {
     return null;
   }
+}
+
+async function mergeWithMeta(row) {
+  if (!row) return null;
+  const base = mapServiceAppointmentRow(row);
+  const meta = await ServiceAppointmentMeta.findOne({ appointmentId: row.id }).lean();
+  if (meta) {
+    base.notes = meta.notes || "";
+    base.payment = { ...base.payment, meta: meta.paymentMeta || {} };
+    base.auditLog = meta.auditLog || [];
+  }
+  return base;
+}
+
+async function mergeMany(rows) {
+  if (!rows.length) return [];
+  const ids = rows.map((r) => r.id);
+  const metas = await ServiceAppointmentMeta.find({ appointmentId: { $in: ids } }).lean();
+  const metaMap = {};
+  metas.forEach((m) => { metaMap[m.appointmentId] = m; });
+
+  return rows.map((row) => {
+    const base = mapServiceAppointmentRow(row);
+    const meta = metaMap[row.id];
+    if (meta) {
+      base.notes = meta.notes || "";
+      base.payment = { ...base.payment, meta: meta.paymentMeta || {} };
+      base.auditLog = meta.auditLog || [];
+    }
+    return base;
+  });
 }
 
 /* CREATE */
@@ -77,10 +107,9 @@ export const createServiceAppointment = async (req, res) => {
       hour,
       minute,
       ampm,
-      paymentMethod = "Online",
+      paymentMethod = "Cash",
       amount: amountFromBody,
       fees: feesFromBody,
-      email,
       meta = {},
       notes = "",
       serviceImageUrl: serviceImageUrlFromBody,
@@ -112,165 +141,84 @@ export const createServiceAppointment = async (req, res) => {
     }
 
     // DUPLICATE BOOKING CHECK
-    try {
-      const existing = await ServiceAppointment.findOne({
-        serviceId: String(serviceId),
-        createdBy: clerkUserId,
-        date: String(date),
-        hour: Number(finalHour),
-        minute: Number(finalMinute),
-        ampm: finalAmpm,
-        status: { $ne: "Canceled" },
-      }).lean();
-      if (existing) return res.status(409).json({ success: false, message: "You already have a booking for this service at the selected date and time." });
-    } catch (chkErr) {
-      console.warn("Duplicate booking check failed:", chkErr);
-    }
+    const existing = await queryOne(
+      "SELECT id FROM service_appointments WHERE serviceId = ? AND createdBy = ? AND appointmentDate = ? AND hour = ? AND minute = ? AND ampm = ? AND status != 'Canceled'",
+      [String(serviceId), clerkUserId, String(date), Number(finalHour), Number(finalMinute), finalAmpm]
+    );
+    if (existing) return res.status(409).json({ success: false, message: "You already have a booking for this service at the selected date and time." });
 
-    // Fetch service snapshot (non-fatal)
-    let svc = null;
-    try { svc = await Service.findById(serviceId).lean(); } catch (e) { console.warn("Service lookup failed:", e?.message || e); }
+    // Fetch service snapshot from MySQL
+    const svc = await queryOne("SELECT * FROM services WHERE id = ?", [serviceId]);
 
-    let resolvedServiceName = serviceNameFromBody || (svc && (svc.name || svc.title)) || "Service";
-    const svcImageUrlFromDB = svc && (String(svc.imageUrl || svc.image || svc.image?.url || svc.profileImage?.url || "").trim() || "");
-    const svcImagePublicIdFromDB = svc && (String(svc.imagePublicId || svc.image?.publicId || svc.profileImage?.publicId || "").trim() || "");
-    const finalServiceImageUrl = (svcImageUrlFromDB && svcImageUrlFromDB.length) ? svcImageUrlFromDB : ((serviceImageUrlFromBody && String(serviceImageUrlFromBody).trim()) || "");
-    const finalServiceImagePublicId = (svcImagePublicIdFromDB && svcImagePublicIdFromDB.length) ? svcImagePublicIdFromDB : ((serviceImagePublicIdFromBody && String(serviceImagePublicIdFromBody).trim()) || "");
+    const resolvedServiceName = serviceNameFromBody || (svc && svc.name) || "Service";
+    const finalServiceImageUrl = (svc && svc.imageUrl) || serviceImageUrlFromBody || "";
+    const finalServiceImagePublicId = (svc && svc.imagePublicId) || serviceImagePublicIdFromBody || "";
 
-    const base = {
-      serviceId,
-      serviceName: resolvedServiceName,
-      serviceImage: { url: finalServiceImageUrl, publicId: finalServiceImagePublicId },
+    const id = newId();
+
+    // Insert structured data into MySQL
+    await insertRow("service_appointments", {
+      id,
+      createdBy: clerkUserId,
       patientName: String(patientName).trim(),
       mobile: String(mobile).trim(),
-      age: age ? Number(age) : undefined,
+      age: age ? Number(age) : null,
       gender: gender || "",
-      date: String(date),
+      serviceId: String(serviceId),
+      serviceName: resolvedServiceName,
+      serviceImageUrl: finalServiceImageUrl,
+      serviceImagePublicId: finalServiceImagePublicId,
+      fees: numericAmount,
+      appointmentDate: String(date),
       hour: Number(finalHour),
       minute: Number(finalMinute),
       ampm: finalAmpm,
-      fees: numericAmount,
-      createdBy: clerkUserId,
+      status: "Pending",
+      paymentMethod: paymentMethod === "Cash" ? "Cash" : "Online",
+      paymentStatus: numericAmount === 0 ? "Paid" : "Pending",
+      paymentAmount: numericAmount,
+      paidAt: numericAmount === 0 ? toMySQLDatetime(new Date()) : null,
+    });
+
+    // Insert semi-structured data into MongoDB
+    await ServiceAppointmentMeta.create({
+      appointmentId: id,
       notes: notes || "",
-    };
+      paymentMeta: meta || {},
+    });
 
-    // Free appointment
-    if (numericAmount === 0) {
-      const created = await ServiceAppointment.create({ ...base, status: "Pending", payment: { method: "Cash", status: "Pending", amount: 0, paidAt: new Date() } });
-      return res.status(201).json({ success: true, appointment: created });
-    }
-
-    // Cash booking
-    if (paymentMethod === "Cash") {
-      const created = await ServiceAppointment.create({ ...base, status: "Pending", payment: { method: "Cash", status: "Pending", amount: numericAmount, meta } });
-      return res.status(201).json({ success: true, appointment: created, checkoutUrl: null });
-    }
-
-    // Online booking (Stripe)
-    if (!stripe) return res.status(500).json({ success: false, message: "Stripe not configured on server" });
-    const frontendBase = buildFrontendBase(req);
-    if (!frontendBase) return res.status(500).json({ success: false, message: "Frontend base URL not available. Set FRONTEND_URL or provide Origin header." });
-
-    const successUrl = `${frontendBase}/service-appointment/success?session_id={CHECKOUT_SESSION_ID}`;
-    const cancelUrl = `${frontendBase}/service-appointment/cancel`;
-
-    let session;
-    try {
-      session = await stripe.checkout.sessions.create({
-        payment_method_types: ["card"],
-        mode: "payment",
-        customer_email: email ? String(email) : undefined,
-        line_items: [
-          {
-            price_data: {
-              currency: "inr",
-              product_data: {
-                name: `Service: ${String(resolvedServiceName).slice(0, 60)}`,
-                description: `Appointment on ${base.date} ${base.hour}:${String(base.minute).padStart(2, "0")} ${base.ampm}`,
-              },
-              unit_amount: Math.round(numericAmount * 100),
-            },
-            quantity: 1,
-          },
-        ],
-        success_url: successUrl,
-        cancel_url: cancelUrl,
-        metadata: {
-          serviceId: String(serviceId),
-          serviceName: String(resolvedServiceName).slice(0, 200),
-          patientName: base.patientName,
-          mobile: base.mobile,
-          clerkUserId: base.createdBy || "",
-          serviceImageUrl: finalServiceImageUrl ? String(finalServiceImageUrl).slice(0, 200) : "",
-        },
-      });
-    } catch (stripeErr) {
-      console.error("Stripe create session error:", stripeErr);
-      const message = stripeErr?.raw?.message || stripeErr?.message || "Stripe error";
-      return res.status(502).json({ success: false, message: `Payment provider error: ${message}` });
-    }
-
-    try {
-      const created = await ServiceAppointment.create({
-        ...base,
-        status: "Confirmed",
-        payment: { method: "Online", status: "Pending", amount: numericAmount, sessionId: session.id || "" },
-      });
-      return res.status(201).json({ success: true, appointment: created, checkoutUrl: session.url || null });
-    } catch (dbErr) {
-      console.error("DB error saving service appointment after stripe session:", dbErr);
-      return res.status(500).json({ success: false, message: "Failed to create appointment record" });
-    }
+    const row = await queryOne("SELECT * FROM service_appointments WHERE id = ?", [id]);
+    const appt = await mergeWithMeta(row);
+    return res.status(201).json({ success: true, appointment: appt, checkoutUrl: null });
   } catch (err) {
     console.error("createServiceAppointment unexpected:", err);
     return res.status(500).json({ success: false, message: "Server error" });
   }
 };
 
-/* CONFIRM (called after Stripe redirect/webhook) */
+/* CONFIRM PAYMENT (manual/cash) */
 export const confirmServicePayment = async (req, res) => {
   try {
-    const { session_id } = req.query;
-    if (!session_id) return res.status(400).json({ success: false, message: "session_id is required" });
-    if (!stripe) return res.status(500).json({ success: false, message: "Stripe not configured" });
+    const { session_id, appointment_id } = req.query;
+    const id = appointment_id || session_id;
+    if (!id) return res.status(400).json({ success: false, message: "appointment_id or session_id is required" });
 
-    let session;
-    try { session = await stripe.checkout.sessions.retrieve(session_id); } catch (err) {
-      console.error("Stripe retrieve session error:", err);
-      return res.status(404).json({ success: false, message: "Stripe session not found" });
+    let row = await queryOne("SELECT * FROM service_appointments WHERE id = ?", [id]);
+    if (!row) {
+      row = await queryOne("SELECT * FROM service_appointments WHERE paymentSessionId = ?", [id]);
     }
-    if (!session) return res.status(404).json({ success: false, message: "Invalid session" });
-    if (session.payment_status !== "paid") return res.status(400).json({ success: false, message: "Payment not completed" });
+    if (!row) return res.status(404).json({ success: false, message: "Service appointment not found" });
 
-    let appt = await ServiceAppointment.findOneAndUpdate(
-      { "payment.sessionId": session_id },
-      {
-        $set: {
-          "payment.status": "Confirmed",
-          "payment.providerId": session.payment_intent || "",
-          "payment.paidAt": new Date(),
-          status: "Confirmed",
-        },
-      },
-      { new: true }
-    );
-
-    if (!appt && session.metadata?.appointmentId) {
-      appt = await ServiceAppointment.findOneAndUpdate(
-        { _id: session.metadata.appointmentId },
-        {
-          $set: {
-            "payment.status": "Confirmed",
-            "payment.providerId": session.payment_intent || "",
-            "payment.paidAt": new Date(),
-            status: "Confirmed",
-          },
-        },
-        { new: true }
-      );
+    if (row.paymentStatus !== "Paid") {
+      await updateRow("service_appointments", row.id, {
+        paymentStatus: "Paid",
+        status: "Confirmed",
+        paidAt: toMySQLDatetime(new Date()),
+      });
     }
 
-    if (!appt) return res.status(404).json({ success: false, message: "Service appointment not found" });
+    const updated = await queryOne("SELECT * FROM service_appointments WHERE id = ?", [row.id]);
+    const appt = await mergeWithMeta(updated);
     return res.json({ success: true, appointment: appt });
   } catch (err) {
     console.error("confirmServicePayment:", err);
@@ -284,26 +232,24 @@ export const getServiceAppointments = async (req, res) => {
     const { serviceId, mobile, status, page: pageRaw = 1, limit: limitRaw = 50, search = "" } = req.query;
     const limit = Math.min(200, Math.max(1, parseInt(limitRaw, 10) || 50));
     const page = Math.max(1, parseInt(pageRaw, 10) || 1);
-    const skip = (page - 1) * limit;
+    const offset = (page - 1) * limit;
 
-    const filter = {};
-    if (serviceId) filter.serviceId = serviceId;
-    if (mobile) filter.mobile = mobile;
-    if (status) filter.status = status;
+    const conditions = [];
+    const params = [];
+    if (serviceId) { conditions.push("serviceId = ?"); params.push(serviceId); }
+    if (mobile) { conditions.push("mobile = ?"); params.push(mobile); }
+    if (status) { conditions.push("status = ?"); params.push(status); }
     if (search) {
-      const re = new RegExp(search, "i");
-      filter.$or = [{ patientName: re }, { mobile: re }, { notes: re }];
+      conditions.push("(patientName LIKE ? OR mobile LIKE ?)");
+      params.push(`%${search}%`, `%${search}%`);
     }
 
-    const appointments = await ServiceAppointment.find(filter)
-      .populate("serviceId", "name image imageUrl imageSmall")
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .lean();
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = await query(`SELECT * FROM service_appointments ${where} ORDER BY createdAt DESC LIMIT ? OFFSET ?`, [...params, limit, offset]);
+    const [countRes] = await pool.execute(`SELECT COUNT(*) AS total FROM service_appointments ${where}`, params);
+    const total = countRes[0].total;
 
-    const total = await ServiceAppointment.countDocuments(filter);
-
+    const appointments = await mergeMany(rows);
     return res.json({ success: true, appointments, meta: { page, limit, total, count: appointments.length } });
   } catch (err) {
     console.error("getServiceAppointments:", err);
@@ -315,8 +261,9 @@ export const getServiceAppointments = async (req, res) => {
 export const getServiceAppointmentById = async (req, res) => {
   try {
     const { id } = req.params;
-    const appt = await ServiceAppointment.findById(id).lean();
-    if (!appt) return res.status(404).json({ success: false, message: "Not found" });
+    const row = await queryOne("SELECT * FROM service_appointments WHERE id = ?", [id]);
+    if (!row) return res.status(404).json({ success: false, message: "Not found" });
+    const appt = await mergeWithMeta(row);
     return res.json({ success: true, data: appt });
   } catch (err) {
     console.error("getServiceAppointmentById:", err);
@@ -329,45 +276,61 @@ export const updateServiceAppointment = async (req, res) => {
   try {
     const { id } = req.params;
     const body = req.body || {};
-    const updates = {};
 
-    if (body.status !== undefined) updates.status = body.status;
-    if (body.notes !== undefined) updates.notes = body.notes;
-    if (body.payment !== undefined) updates.payment = body.payment;
-    if (body["payment.status"] !== undefined) updates["payment.status"] = body["payment.status"];
+    const existing = await queryOne("SELECT * FROM service_appointments WHERE id = ?", [id]);
+    if (!existing) return res.status(404).json({ success: false, message: "Not found" });
+
+    const mysqlUpdate = {};
+    if (body.status !== undefined) mysqlUpdate.status = body.status;
+    if (body["payment.status"] !== undefined) mysqlUpdate.paymentStatus = body["payment.status"];
+
+    if (body.payment !== undefined) {
+      if (body.payment.method) mysqlUpdate.paymentMethod = body.payment.method;
+      if (body.payment.status) {
+        mysqlUpdate.paymentStatus = body.payment.status;
+        if (body.payment.status === "Confirmed" || body.payment.status === "Paid") {
+          mysqlUpdate.status = mysqlUpdate.status || "Confirmed";
+          mysqlUpdate.paidAt = toMySQLDatetime(body.payment.paidAt || new Date());
+        }
+      }
+      if (body.payment.providerId) mysqlUpdate.paymentProviderId = body.payment.providerId;
+    }
 
     if (body.rescheduledTo) {
       const { date, time } = body.rescheduledTo || {};
-      updates.rescheduledTo = {};
       if (date) {
         if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ success: false, message: "rescheduledTo.date must be YYYY-MM-DD" });
-        updates.rescheduledTo.date = date;
-        updates.date = date;
+        mysqlUpdate.rescheduledDate = date;
+        mysqlUpdate.appointmentDate = date;
       }
       if (time) {
-        updates.rescheduledTo.time = String(time);
         const parsed = parseTimeString(String(time));
         if (!parsed) return res.status(400).json({ success: false, message: "rescheduledTo.time couldn't be parsed" });
-        updates.hour = parsed.hour;
-        updates.minute = parsed.minute;
-        updates.ampm = parsed.ampm;
-        updates.time = `${String(parsed.hour).padStart(2, "0")}:${String(parsed.minute).padStart(2, "0")} ${parsed.ampm}`;
+        mysqlUpdate.rescheduledHour = parsed.hour;
+        mysqlUpdate.rescheduledMinute = parsed.minute;
+        mysqlUpdate.rescheduledAmpm = parsed.ampm;
+        mysqlUpdate.hour = parsed.hour;
+        mysqlUpdate.minute = parsed.minute;
+        mysqlUpdate.ampm = parsed.ampm;
       }
-      if (!body.status) updates.status = "Rescheduled";
+      if (!body.status) mysqlUpdate.status = "Rescheduled";
     }
 
-    if (updates.payment) {
-      const method = updates.payment.method || updates.payment?.method;
-      if (method && String(method).toLowerCase() === "online") updates.status = updates.status || "Confirmed";
-      if (updates.payment.status && updates.payment.status === "Confirmed") {
-        updates.status = "Confirmed";
-        if (updates.payment.paidAt === undefined) updates.payment.paidAt = new Date();
-      }
+    if (Object.keys(mysqlUpdate).length > 0) {
+      await updateRow("service_appointments", id, mysqlUpdate);
     }
 
-    const updated = await ServiceAppointment.findByIdAndUpdate(id, { $set: updates }, { new: true, runValidators: true });
-    if (!updated) return res.status(404).json({ success: false, message: "Not found" });
-    return res.json({ success: true, data: updated });
+    // Update MongoDB meta for notes/payment meta
+    const metaUpdate = {};
+    if (body.notes !== undefined) metaUpdate.notes = body.notes;
+    if (body.payment?.meta !== undefined) metaUpdate.paymentMeta = body.payment.meta;
+    if (Object.keys(metaUpdate).length > 0) {
+      await ServiceAppointmentMeta.findOneAndUpdate({ appointmentId: id }, metaUpdate, { upsert: true });
+    }
+
+    const updated = await queryOne("SELECT * FROM service_appointments WHERE id = ?", [id]);
+    const appt = await mergeWithMeta(updated);
+    return res.json({ success: true, data: appt });
   } catch (err) {
     console.error("updateServiceAppointment:", err);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -378,13 +341,18 @@ export const updateServiceAppointment = async (req, res) => {
 export const cancelServiceAppointment = async (req, res) => {
   try {
     const { id } = req.params;
-    const appt = await ServiceAppointment.findById(id);
-    if (!appt) return res.status(404).json({ success: false, message: "Not found" });
-    if (appt.status === "Completed") return res.status(400).json({ success: false, message: "Cannot cancel a completed appointment" });
+    const row = await queryOne("SELECT * FROM service_appointments WHERE id = ?", [id]);
+    if (!row) return res.status(404).json({ success: false, message: "Not found" });
+    if (row.status === "Completed") return res.status(400).json({ success: false, message: "Cannot cancel a completed appointment" });
 
-    appt.status = "Canceled";
-    if (appt.payment) appt.payment.status = appt.payment.status === "Confirmed" ? "Canceled" : "Pending";
-    await appt.save();
+    const newPaymentStatus = row.paymentStatus === "Paid" ? "Refunded" : "Canceled";
+    await updateRow("service_appointments", id, {
+      status: "Canceled",
+      paymentStatus: newPaymentStatus,
+    });
+
+    const updated = await queryOne("SELECT * FROM service_appointments WHERE id = ?", [id]);
+    const appt = await mergeWithMeta(updated);
     return res.json({ success: true, data: appt });
   } catch (err) {
     console.error("cancelServiceAppointment:", err);
@@ -395,23 +363,19 @@ export const cancelServiceAppointment = async (req, res) => {
 /* STATS */
 export const getServiceAppointmentStats = async (req, res) => {
   try {
-    const services = await Service.aggregate([
-      {
-        $lookup: { from: "serviceappointments", localField: "_id", foreignField: "serviceId", as: "appointments" },
-      },
-      {
-        $addFields: {
-          totalAppointments: { $size: "$appointments" },
-          completed: { $size: { $filter: { input: "$appointments", as: "a", cond: { $eq: ["$$a.status", "Completed"] } } } },
-          canceled: { $size: { $filter: { input: "$appointments", as: "a", cond: { $eq: ["$$a.status", "Canceled"] } } } },
-        },
-      },
-      { $addFields: { earning: { $multiply: ["$completed", "$price"] } } },
-      { $project: { name: 1, price: 1, image: "$imageUrl", totalAppointments: 1, completed: 1, canceled: 1, earning: 1 } },
-      { $sort: { createdAt: -1 } },
-    ]);
+    const rows = await query(`
+      SELECT s.id, s.name, s.price, s.imageUrl AS image,
+        COUNT(sa.id) AS totalAppointments,
+        SUM(CASE WHEN sa.status = 'Completed' THEN 1 ELSE 0 END) AS completed,
+        SUM(CASE WHEN sa.status = 'Canceled' THEN 1 ELSE 0 END) AS canceled,
+        SUM(CASE WHEN sa.status = 'Completed' THEN s.price ELSE 0 END) AS earning
+      FROM services s
+      LEFT JOIN service_appointments sa ON sa.serviceId = s.id
+      GROUP BY s.id
+      ORDER BY s.createdAt DESC
+    `);
 
-    return res.json({ success: true, services, totalServices: services.length });
+    return res.json({ success: true, services: rows, totalServices: rows.length });
   } catch (err) {
     console.error("getServiceAppointmentStats:", err);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -426,11 +390,14 @@ export const getServiceAppointmentsByPatient = async (req, res) => {
     const resolvedCreatedBy = createdBy || clerkUserId || null;
     if (!resolvedCreatedBy && !mobile) return res.json({ success: true, data: [] });
 
-    const filter = {};
-    if (resolvedCreatedBy) filter.createdBy = resolvedCreatedBy;
-    if (mobile) filter.mobile = mobile;
+    const conditions = [];
+    const params = [];
+    if (resolvedCreatedBy) { conditions.push("createdBy = ?"); params.push(resolvedCreatedBy); }
+    if (mobile) { conditions.push("mobile = ?"); params.push(mobile); }
 
-    const list = await ServiceAppointment.find(filter).sort({ createdAt: -1 }).lean();
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = await query(`SELECT * FROM service_appointments ${where} ORDER BY createdAt DESC`, params);
+    const list = await mergeMany(rows);
     return res.json({ success: true, data: list });
   } catch (err) {
     console.error("getServiceAppointmentsByPatient:", err);

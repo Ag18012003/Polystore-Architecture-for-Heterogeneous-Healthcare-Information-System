@@ -25,7 +25,7 @@ const appointmentRouter = express.Router();
 // list appointments
 appointmentRouter.get("/", getAppointments);
 
-// stripe confirm
+// payment confirm
 appointmentRouter.get("/confirm", confirmPayment);
 
 // stats

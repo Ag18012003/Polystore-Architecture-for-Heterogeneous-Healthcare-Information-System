@@ -2,6 +2,7 @@ import cors from 'cors';
 import 'dotenv/config';
 import express from 'express';
 import { connectDB } from './config/db.js';
+import { connectMySQL, initMySQL } from './config/mysql.js';
 
 // ⭐ ADD CLERK MIDDLEWARE
 import { clerkMiddleware } from "@clerk/express";
@@ -45,6 +46,9 @@ app.use(express.urlencoded({ limit: "20mb", extended: true }));
 
 // Database Connection
 connectDB();
+connectMySQL()
+  .then(() => initMySQL())
+  .catch((err) => console.error("MySQL init error:", err.message));
 
 // Static uploads folder
 

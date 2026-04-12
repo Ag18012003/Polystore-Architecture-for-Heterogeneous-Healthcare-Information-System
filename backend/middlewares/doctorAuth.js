@@ -1,7 +1,6 @@
 // backend/middleware/doctorAuth.js
 import jwt from "jsonwebtoken";
-import Doctor from "../models/Doctor.js";
-
+import { queryOne } from "../utils/queryHelpers.js";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_here";
 
@@ -30,8 +29,8 @@ export default async function doctorAuth(req, res, next) {
       });
     }
 
-    // 3. Fetch doctor
-    const doctor = await Doctor.findById(payload.id).select("-password");
+    // 3. Fetch doctor from MySQL
+    const doctor = await queryOne("SELECT id, email, name, specialization, imageUrl, availability FROM doctors WHERE id = ?", [payload.id]);
 
     if (!doctor) {
       return res.status(401).json({
