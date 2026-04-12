@@ -1,64 +1,40 @@
 // routes/appointmentRouter.js
 import express from "express";
-import { clerkMiddleware, requireAuth } from "@clerk/express";
-
+import rateLimit from "express-rate-limit";
 import {
   getAppointments,
   getAppointmentById,
   createAppointment,
-  confirmPayment,
   updateAppointment,
   cancelAppointment,
   getStats,
-  getAppointmentsByPatient,
   getAppointmentsByDoctor,
-  
-  getRegisteredUserCount,
 } from "../controllers/appointmentController.js";
 
 const appointmentRouter = express.Router();
 
-/* =========================
-   PUBLIC / FIXED ROUTES
-   ========================= */
+const createLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many requests, please try again later" },
+});
 
-// list appointments
-appointmentRouter.get("/", getAppointments);
+const readLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many requests, please try again later" },
+});
 
-// stripe confirm
-appointmentRouter.get("/confirm", confirmPayment);
-
-// stats
-appointmentRouter.get("/stats/summary", getStats);
-
-/* =========================
-   AUTHENTICATED ROUTES
-   ========================= */
-
-// create appointment
-appointmentRouter.post(
-  "/",
-  clerkMiddleware(),
-  requireAuth(),
-  createAppointment
-);
-
-// 🔥 IMPORTANT: /me MUST COME BEFORE /:id
-appointmentRouter.get(
-  "/me",
-  clerkMiddleware(),
-  requireAuth(),
-  getAppointmentsByPatient
-);
-// appointmentRouter.get("/:id", getAppointmentById);
-appointmentRouter.get(
-  "/doctor/:doctorId",
-  getAppointmentsByDoctor
-);
-
-appointmentRouter.post("/:id/cancel", cancelAppointment);
-appointmentRouter.get("/paitents/count",getRegisteredUserCount); 
-appointmentRouter.put("/:id", updateAppointment);
-
+appointmentRouter.get("/", readLimiter, getAppointments);
+appointmentRouter.get("/stats/summary", readLimiter, getStats);
+appointmentRouter.post("/", createLimiter, createAppointment);
+appointmentRouter.get("/doctor/:doctorId", readLimiter, getAppointmentsByDoctor);
+appointmentRouter.get("/:id", readLimiter, getAppointmentById);
+appointmentRouter.put("/:id", createLimiter, updateAppointment);
+appointmentRouter.post("/:id/cancel", createLimiter, cancelAppointment);
 
 export default appointmentRouter;

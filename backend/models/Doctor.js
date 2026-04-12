@@ -1,52 +1,115 @@
-import mongoose from "mongoose";
+// models/Doctor.js - MySQL-based model
+import pool from "../config/mysql.js";
 
-const doctorSchema = new mongoose.Schema(
-  {
-    email: {
-      type: String,
-      required: true,
-      unique: true,
-      lowercase: true,
-      index: true,
-    },
-
-    // ⚠️ Plain text password (NOT hashed)
-    password: {
-      type: String,
-      required: true,
-      select: false,
-    },
-
-    name: { type: String, required: true, trim: true },
-    specialization: { type: String, default: "" },
-
-    imageUrl: { type: String, default: null },
-    imagePublicId: { type: String, default: null },
-
-    experience: { type: String, default: "" },
-    qualifications: { type: String, default: "" },
-    location: { type: String, default: "" },
-    about: { type: String, default: "" },
-
-    fee: { type: Number, default: 0 },
-    availability: {
-      type: String,
-      enum: ["Available", "Unavailable"],
-      default: "Available",
-    },
-
-    schedule: { type: Map, of: [String], default: {} },
-    success: { type: String, default: "" },
-    patients: { type: String, default: "" },
-    rating: { type: Number, default: 0 },
+const Doctor = {
+  async findAll({ search = "", limit = 200, offset = 0 } = {}) {
+    let sql = "SELECT * FROM doctors";
+    const params = [];
+    if (search) {
+      sql += " WHERE name LIKE ? OR specialization LIKE ? OR email LIKE ?";
+      const like = `%${search}%`;
+      params.push(like, like, like);
+    }
+    sql += " ORDER BY name ASC LIMIT ? OFFSET ?";
+    params.push(limit, offset);
+    const [rows] = await pool.query(sql, params);
+    return rows;
   },
-  { timestamps: true }
-);
 
-// text search
-doctorSchema.index({ name: "text", specialization: "text" });
+  async countAll({ search = "" } = {}) {
+    let sql = "SELECT COUNT(*) AS total FROM doctors";
+    const params = [];
+    if (search) {
+      sql += " WHERE name LIKE ? OR specialization LIKE ? OR email LIKE ?";
+      const like = `%${search}%`;
+      params.push(like, like, like);
+    }
+    const [[row]] = await pool.query(sql, params);
+    return row.total;
+  },
 
-const Doctor =
-  mongoose.models.Doctor || mongoose.model("Doctor", doctorSchema);
+  async findById(id) {
+    const [[row]] = await pool.query("SELECT * FROM doctors WHERE id = ?", [id]);
+    return row || null;
+  },
+
+  async findByEmail(email) {
+    const [[row]] = await pool.query(
+      "SELECT * FROM doctors WHERE email = ?",
+      [email.toLowerCase()]
+    );
+    return row || null;
+  },
+
+  async create(data) {
+    const {
+      email,
+      password,
+      name,
+      specialization = "",
+      fee = 0,
+      experience = "",
+      qualifications = "",
+      location = "",
+      imageUrl = null,
+      availability = "Available",
+      about = "",
+    } = data;
+    const [result] = await pool.query(
+      `INSERT INTO doctors
+        (email, password, name, specialization, fee, experience, qualifications, location, imageUrl, availability, about)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        email.toLowerCase(),
+        password,
+        name,
+        specialization,
+        fee,
+        experience,
+        qualifications,
+        location,
+        imageUrl,
+        availability,
+        about,
+      ]
+    );
+    return Doctor.findById(result.insertId);
+  },
+
+  async update(id, data) {
+    const allowed = [
+      "name",
+      "specialization",
+      "fee",
+      "experience",
+      "qualifications",
+      "location",
+      "imageUrl",
+      "availability",
+      "about",
+      "password",
+      "email",
+    ];
+    const fields = [];
+    const values = [];
+    for (const key of allowed) {
+      if (data[key] !== undefined) {
+        fields.push(`${key} = ?`);
+        values.push(key === "email" ? data[key].toLowerCase() : data[key]);
+      }
+    }
+    if (fields.length === 0) return Doctor.findById(id);
+    values.push(id);
+    await pool.query(
+      `UPDATE doctors SET ${fields.join(", ")} WHERE id = ?`,
+      values
+    );
+    return Doctor.findById(id);
+  },
+
+  async delete(id) {
+    await pool.query("DELETE FROM doctors WHERE id = ?", [id]);
+  },
+};
 
 export default Doctor;

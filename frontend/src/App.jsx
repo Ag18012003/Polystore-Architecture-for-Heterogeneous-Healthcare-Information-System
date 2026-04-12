@@ -19,8 +19,6 @@ import EditProfile from "./pages/EditProfile/EditProfile";
 
 // Lucide icon
 import { CircleChevronUp } from "lucide-react";
-import VerifyPaymentPage from "../VerifyPaymetPage";
-import VerifyServicePaymentPage from "../VerifyServicePaymentPage";
 
 /* ================= Scroll To Top ================= */
 const ScrollToTop = () => {
@@ -42,7 +40,6 @@ const ScrollButton = () => {
   useEffect(() => {
     const handleScroll = () => setVisible(window.scrollY > 200);
     window.addEventListener("scroll", handleScroll, { passive: true });
-
     return () => window.removeEventListener("scroll", handleScroll);
   }, []);
 
@@ -64,7 +61,6 @@ const ScrollButton = () => {
 
 /* ================= Main App ================= */
 const App = () => {
-  // Lock horizontal overflow globally
   useEffect(() => {
     document.body.style.overflowX = "hidden";
     document.documentElement.style.overflowX = "hidden";
@@ -90,26 +86,10 @@ const App = () => {
           <Route path="/appointments" element={<Appointments />} />
           <Route path="/doctor-admin/login" element={<Login />} />
 
-          {/* ✅ STRIPE PAYMENT ROUTES */}
-          <Route path="/appointment/success" element={<VerifyPaymentPage />} />
-          <Route path="/appointment/cancel" element={<VerifyPaymentPage />} />
-
-          <Route
-            path="/service-appointment/success"
-            element={<VerifyServicePaymentPage />}
-          />
-          <Route
-            path="/service-appointment/cancel"
-            element={<VerifyServicePaymentPage />}
-          />
-
           {/* Doctor Admin */}
           <Route path="/doctor-admin/:id" element={<DHome />} />
           <Route path="/doctor-admin/:id/appointments" element={<List />} />
-          <Route
-            path="/doctor-admin/:id/profile/edit"
-            element={<EditProfile />}
-          />
+          <Route path="/doctor-admin/:id/profile/edit" element={<EditProfile />} />
         </Routes>
       </div>
 

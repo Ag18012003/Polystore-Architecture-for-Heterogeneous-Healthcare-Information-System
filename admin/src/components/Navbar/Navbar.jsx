@@ -19,8 +19,6 @@ import {
 } from "lucide-react";
 import logoImg from "../../assets/logo.png";
 
-// Clerk hooks
-import { useClerk, useAuth, useUser } from "@clerk/clerk-react";
 import { navbarStyles as ns } from "../../assets/dummyStyles";
 
 export default function AnimatedNavbar() {
@@ -30,10 +28,7 @@ export default function AnimatedNavbar() {
   const location = useLocation();
   const navigate = useNavigate();
 
-  // Clerk
-  const clerk = useClerk?.();
-  const { getToken, isLoaded: authLoaded } = useAuth();
-  const { isSignedIn, user, isLoaded: userLoaded } = useUser();
+
 
   /* ---------------- Sliding Active Indicator ---------------- */
   const moveIndicator = useCallback(() => {
@@ -101,70 +96,15 @@ export default function AnimatedNavbar() {
     return () => window.removeEventListener("keydown", onKey);
   }, [open]);
 
-  // When user signs in, fetch a token and store it in localStorage
-  useEffect(() => {
-    let mounted = true;
-    const storeToken = async () => {
-      if (!authLoaded || !userLoaded) return;
-      if (!isSignedIn) {
-        // clear token on signed out
-        try {
-          localStorage.removeItem("clerk_token");
-        } catch (e) {
-          /* ignore */
-        }
-        return;
-      }
-      try {
-        if (getToken) {
-          const token = await getToken();
-          if (!mounted) return;
-          if (token) {
-            try {
-              localStorage.setItem("clerk_token", token);
-            } catch (e) {
-              console.warn("Failed to write clerk token to localStorage", e);
-            }
-          }
-        }
-      } catch (err) {
-        console.warn("Could not retrieve Clerk token:", err);
-      }
-    };
 
-    storeToken();
-    return () => {
-      mounted = false;
-    };
-  }, [isSignedIn, authLoaded, userLoaded, getToken]);
 
   const handleOpenSignIn = () => {
-    if (!clerk || !clerk.openSignIn) {
-      console.warn("Clerk is not available to open sign-in.");
-      return;
-    }
-    clerk.openSignIn();
+    // Authentication handled by doctor JWT token
     navigate('/h')
   };
 
-  const handleSignOut = async () => {
-    if (!clerk || !clerk.signOut) {
-      console.warn("Clerk signOut not available.");
-      return;
-    }
-    try {
-      await clerk.signOut();
-    } catch (err) {
-      console.error("Sign out failed:", err);
-    } finally {
-      try {
-        localStorage.removeItem("clerk_token");
-      } catch (e) {
-        /* ignore */
-      }
-      // redirect to home after sign out
-      navigate("/");
-    }
+  const handleSignOut = () => {
+    navigate("/");
   };
 
   return (
@@ -246,23 +186,7 @@ export default function AnimatedNavbar() {
           {/* RIGHT */}
           <div className={ns.rightContainer}>
             {/* Auth buttons */}
-            {isSignedIn ? (
-              <button
-                onClick={handleSignOut}
-                className={ns.signOutButton + " " + ns.cursorPointer}
-              >
-                Sign Out
-              </button>
-            ) : (
-              <div className="hidden lg:flex items-center gap-2">
-                <button
-                  onClick={handleOpenSignIn}
-                  className={ns.loginButton + " " + ns.cursorPointer}
-                >
-                  Login
-                </button>
-              </div>
-            )}
+
 
             {/* MOBILE MENU ICON */}
             <button
@@ -340,29 +264,14 @@ export default function AnimatedNavbar() {
               />
 
               <div className={ns.mobileAuthContainer}>
-                {isSignedIn ? (
-                  <button
-                    onClick={() => {
-                      handleSignOut();
-                      setOpen(false);
-                    }}
-                    className={ns.mobileSignOutButton}
-                  >
-                    Sign Out
-                  </button>
-                ) : (
-                  <div className="space-y-2">
-                    <button
-                      onClick={() => {
-                        handleOpenSignIn();
-                        setOpen(false);
-                      }}
-                      className={ns.mobileLoginButton + " " + ns.cursorPointer}
-                    >
-                      Login 
-                    </button>
-                  </div>
-                )}
+                <button
+                  onClick={() => {
+                    setOpen(false);
+                  }}
+                  className={ns.mobileLoginButton + " " + ns.cursorPointer}
+                >
+                  Menu
+                </button>
               </div>
             </div>
           </div>

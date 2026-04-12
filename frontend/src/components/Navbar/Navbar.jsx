@@ -3,10 +3,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import logo from "../../assets/logo.png";
-import { Menu, X, User as UserIcon, Key } from "lucide-react";
-
-// Clerk
-import { SignedIn, SignedOut, useClerk, UserButton } from "@clerk/clerk-react";
+import { Menu, X, User as UserIcon } from "lucide-react";
 import { navbarStyles } from "../../assets/dummyStyles";
 
 const STORAGE_KEY = "doctorToken_v1";
@@ -25,10 +22,8 @@ export default function Navbar() {
 
   const location = useLocation();
   const navRef = useRef(null);
-  const clerk = useClerk();
   const navigate = useNavigate();
 
-  /* Hide / show navbar on scroll */
   useEffect(() => {
     const handleScroll = () => {
       const currentScrollY = window.scrollY;
@@ -43,7 +38,6 @@ export default function Navbar() {
     return () => window.removeEventListener("scroll", handleScroll);
   }, [lastScrollY]);
 
-  /* Sync doctor login state */
   useEffect(() => {
     const onStorage = (e) => {
       if (e.key === STORAGE_KEY) {
@@ -54,7 +48,6 @@ export default function Navbar() {
     return () => window.removeEventListener("storage", onStorage);
   }, []);
 
-  /* Close mobile menu on outside click */
   useEffect(() => {
     const handleClickOutside = (event) => {
       if (isOpen && navRef.current && !navRef.current.contains(event.target)) {
@@ -103,12 +96,8 @@ export default function Navbar() {
                 </div>
               </div>
               <div className={navbarStyles.logoTextContainer}>
-                <h1 className={navbarStyles.logoTitle}>
-                  MediCare
-                </h1>
-                <p className={navbarStyles.logoSubtitle}>
-                  Healthcare Solutions
-                </p>
+                <h1 className={navbarStyles.logoTitle}>MediCare</h1>
+                <p className={navbarStyles.logoSubtitle}>Healthcare Solutions</p>
               </div>
             </Link>
 
@@ -136,33 +125,13 @@ export default function Navbar() {
 
             {/* Right side */}
             <div className={navbarStyles.rightContainer}>
-              {/* ================= PATIENT LOGGED OUT ================= */}
-              <SignedOut>
-                {/* Doctor Admin */}
-                <Link
-                  to="/doctor-admin/login"
-                  className={navbarStyles.doctorAdminButton}
-                >
-                  <UserIcon className={navbarStyles.doctorAdminIcon} />
-                  <span className={navbarStyles.doctorAdminText}>
-                    Doctor Admin
-                  </span>
-                </Link>
-
-                {/* Patient Login */}
-                <button
-                  onClick={() => clerk.openSignIn()}
-                  className={navbarStyles.loginButton}
-                >
-                  <Key className={navbarStyles.loginIcon} />
-                  Login
-                </button>
-              </SignedOut>
-
-              {/* ================= PATIENT LOGGED IN ================= */}
-              <SignedIn>
-                <UserButton afterSignOutUrl="/" />
-              </SignedIn>
+              <Link
+                to="/doctor-admin/login"
+                className={navbarStyles.doctorAdminButton}
+              >
+                <UserIcon className={navbarStyles.doctorAdminIcon} />
+                <span className={navbarStyles.doctorAdminText}>Doctor Admin</span>
+              </Link>
 
               {/* Mobile/Tablet toggle */}
               <button
@@ -200,27 +169,13 @@ export default function Navbar() {
                   </Link>
                 );
               })}
-              {/* Patient logged out */}
-              <SignedOut>
-                <Link
-                  to="/doctor-admin/login"
-                  onClick={() => setIsOpen(false)}
-                  className={navbarStyles.mobileDoctorAdminButton}
-                >
-                  Doctor Admin
-                </Link>
-                <div className={navbarStyles.mobileLoginContainer}>
-                  <button
-                    onClick={() => {
-                      setIsOpen(false);
-                      clerk.openSignIn();
-                    }}
-                    className={navbarStyles.mobileLoginButton}
-                  >
-                    Login
-                  </button>
-                </div>
-              </SignedOut>
+              <Link
+                to="/doctor-admin/login"
+                onClick={() => setIsOpen(false)}
+                className={navbarStyles.mobileDoctorAdminButton}
+              >
+                Doctor Admin
+              </Link>
             </div>
           )}
         </div>
