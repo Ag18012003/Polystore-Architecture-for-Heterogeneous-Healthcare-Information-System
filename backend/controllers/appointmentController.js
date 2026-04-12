@@ -1,7 +1,7 @@
 // controllers/appointmentController.js
 import Stripe from "stripe";
 import Appointment from "../models/Appointment.js";
-import Doctor from "../models/Doctor.js";
+import { pool as mysqlPool } from "../config/mysql.js";
 import dotenv from "dotenv";
 import { getAuth } from "@clerk/express";
 import { clerkClient } from "@clerk/clerk-sdk-node";
@@ -66,7 +66,6 @@ export const getAppointments = async (req, res) => {
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
-      .populate("doctorId", "name specialization owner imageUrl image")
       .lean();
 
     const total = await Appointment.countDocuments(filter);
@@ -81,7 +80,7 @@ export const getAppointments = async (req, res) => {
 export const getAppointmentById = async (req, res) => {
   try {
     const { id } = req.params;
-    const appt = await Appointment.findById(id).populate("doctorId", "name specialization owner imageUrl image").lean();
+    const appt = await Appointment.findById(id).lean();
     if (!appt) return res.status(404).json({ success: false, message: "Appointment not found" });
     return res.json({ success: true, appointment: appt });
   } catch (err) {
@@ -170,44 +169,51 @@ export const createAppointment = async (req, res) => {
       });
     }
 
-    // Fetch doctor as source-of-truth
+    // Fetch doctor from MySQL as source-of-truth
     let doctor = null;
     try {
-      doctor = await Doctor.findById(doctorId).lean();
+      const [rows] = await mysqlPool.query("SELECT * FROM doctors WHERE id = ?", [doctorId]);
+      if (rows.length > 0) {
+        const r = rows[0];
+        doctor = {
+          id: r.id,
+          _id: String(r.id),
+          name: r.name || "",
+          specialization: r.specialization || "",
+          imageUrl: r.image_url || "",
+          imagePublicId: r.image_public_id || "",
+          fee: parseFloat(r.fee) || 0,
+        };
+      }
     } catch (e) {
       console.warn("Doctor lookup failed:", e?.message || e);
     }
     if (!doctor) return res.status(404).json({ success: false, message: "Doctor not found" });
 
     // Resolve owner, names, images, etc.
-    let resolvedOwner = ownerFromBody || doctor.owner || null;
-    if (!resolvedOwner) resolvedOwner = MAJOR_ADMIN_ID || String(doctorId);
+    let resolvedOwner = ownerFromBody || null;
+    if (!resolvedOwner) resolvedOwner = MAJOR_ADMIN_ID || String(doctor.id);
 
     const doctorName = (doctor.name && String(doctor.name).trim()) || (doctorNameFromBody && String(doctorNameFromBody).trim()) || "";
     const speciality =
       (doctor.specialization && String(doctor.specialization).trim()) ||
-      (doctor.speciality && String(doctor.speciality).trim()) ||
       (specialityFromBody && String(specialityFromBody).trim()) ||
       "";
 
     const doctorImageUrl =
       (doctor.imageUrl && String(doctor.imageUrl).trim()) ||
-      (doctor.image && String(doctor.image).trim()) ||
-      (doctor.avatarUrl && String(doctor.avatarUrl).trim()) ||
-      (doctor.profileImage && doctor.profileImage.url && String(doctor.profileImage.url).trim()) ||
       (doctorImageUrlFromBody && String(doctorImageUrlFromBody).trim()) ||
       "";
 
     const doctorImagePublicId =
       (doctor.imagePublicId && String(doctor.imagePublicId).trim()) ||
-      (doctor.profileImage && doctor.profileImage.publicId && String(doctor.profileImage.publicId).trim()) ||
       (doctorImagePublicIdFromBody && String(doctorImagePublicIdFromBody).trim()) ||
       "";
 
     const doctorImage = { url: doctorImageUrl, publicId: doctorImagePublicId };
 
     const base = {
-      doctorId: String(doctor._id || doctorId),
+      doctorId: String(doctor.id),
       doctorName,
       speciality,
       doctorImage,
@@ -423,7 +429,6 @@ export const updateAppointment = async (req, res) => {
     }
 
     const updated = await Appointment.findByIdAndUpdate(id, update, { new: true, runValidators: true })
-      .populate({ path: "doctorId", select: "name imageUrl" })
       .lean();
 
     return res.json({ success: true, appointment: updated });
@@ -487,7 +492,6 @@ export const getAppointmentsByDoctor = async (req, res) => {
       .sort({ date: 1, time: 1 })
       .skip(skip)
       .limit(limit)
-      .populate("doctorId", "name specialization owner imageUrl image")
       .lean();
 
     const total = await Appointment.countDocuments(filter);

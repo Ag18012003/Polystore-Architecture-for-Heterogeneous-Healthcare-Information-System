@@ -21,8 +21,7 @@ const appointmentSchema = new mongoose.Schema(
        Doctor Info
     ========================== */
     doctorId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Doctor",
+      type: String, // MySQL doctor id (integer stored as string)
       required: true,
       index: true,
     },
@@ -76,6 +75,8 @@ const appointmentSchema = new mongoose.Schema(
    
 
     sessionId: { type: String, default: null, index: true },
+
+    notes: { type: String, default: "" },
 
     paidAt: { type: Date, default: null },
   },

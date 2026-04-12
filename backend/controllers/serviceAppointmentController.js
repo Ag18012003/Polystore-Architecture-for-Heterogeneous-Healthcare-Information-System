@@ -1,6 +1,6 @@
 // controllers/serviceAppointmentController.js
 import ServiceAppointment from "../models/serviceAppointment.js";
-import Service from "../models/Service.js";
+import { pool as mysqlPool } from "../config/mysql.js";
 import Stripe from "stripe";
 import { getAuth } from "@clerk/express";
 
@@ -127,13 +127,16 @@ export const createServiceAppointment = async (req, res) => {
       console.warn("Duplicate booking check failed:", chkErr);
     }
 
-    // Fetch service snapshot (non-fatal)
+    // Fetch service snapshot from MySQL (non-fatal)
     let svc = null;
-    try { svc = await Service.findById(serviceId).lean(); } catch (e) { console.warn("Service lookup failed:", e?.message || e); }
+    try {
+      const [rows] = await mysqlPool.query("SELECT * FROM services WHERE id = ?", [serviceId]);
+      if (rows.length > 0) svc = rows[0];
+    } catch (e) { console.warn("Service lookup failed:", e?.message || e); }
 
-    let resolvedServiceName = serviceNameFromBody || (svc && (svc.name || svc.title)) || "Service";
-    const svcImageUrlFromDB = svc && (String(svc.imageUrl || svc.image || svc.image?.url || svc.profileImage?.url || "").trim() || "");
-    const svcImagePublicIdFromDB = svc && (String(svc.imagePublicId || svc.image?.publicId || svc.profileImage?.publicId || "").trim() || "");
+    let resolvedServiceName = serviceNameFromBody || (svc && (svc.name)) || "Service";
+    const svcImageUrlFromDB = svc && (String(svc.image_url || "").trim() || "");
+    const svcImagePublicIdFromDB = svc && (String(svc.image_public_id || "").trim() || "");
     const finalServiceImageUrl = (svcImageUrlFromDB && svcImageUrlFromDB.length) ? svcImageUrlFromDB : ((serviceImageUrlFromBody && String(serviceImageUrlFromBody).trim()) || "");
     const finalServiceImagePublicId = (svcImagePublicIdFromDB && svcImagePublicIdFromDB.length) ? svcImagePublicIdFromDB : ((serviceImagePublicIdFromBody && String(serviceImagePublicIdFromBody).trim()) || "");
 
@@ -296,7 +299,6 @@ export const getServiceAppointments = async (req, res) => {
     }
 
     const appointments = await ServiceAppointment.find(filter)
-      .populate("serviceId", "name image imageUrl imageSmall")
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
@@ -395,23 +397,49 @@ export const cancelServiceAppointment = async (req, res) => {
 /* STATS */
 export const getServiceAppointmentStats = async (req, res) => {
   try {
-    const services = await Service.aggregate([
-      {
-        $lookup: { from: "serviceappointments", localField: "_id", foreignField: "serviceId", as: "appointments" },
-      },
-      {
-        $addFields: {
-          totalAppointments: { $size: "$appointments" },
-          completed: { $size: { $filter: { input: "$appointments", as: "a", cond: { $eq: ["$$a.status", "Completed"] } } } },
-          canceled: { $size: { $filter: { input: "$appointments", as: "a", cond: { $eq: ["$$a.status", "Canceled"] } } } },
-        },
-      },
-      { $addFields: { earning: { $multiply: ["$completed", "$price"] } } },
-      { $project: { name: 1, price: 1, image: "$imageUrl", totalAppointments: 1, completed: 1, canceled: 1, earning: 1 } },
-      { $sort: { createdAt: -1 } },
-    ]);
+    // Get services from MySQL
+    const [services] = await mysqlPool.query("SELECT * FROM services ORDER BY created_at DESC");
 
-    return res.json({ success: true, services, totalServices: services.length });
+    // Get appointment stats from MongoDB
+    const serviceIds = services.map((s) => String(s.id));
+    const apptStats = {};
+    if (serviceIds.length > 0) {
+      const stats = await ServiceAppointment.aggregate([
+        { $match: { serviceId: { $in: serviceIds } } },
+        {
+          $group: {
+            _id: "$serviceId",
+            totalAppointments: { $sum: 1 },
+            completed: {
+              $sum: { $cond: [{ $eq: ["$status", "Completed"] }, 1, 0] },
+            },
+            canceled: {
+              $sum: { $cond: [{ $eq: ["$status", "Canceled"] }, 1, 0] },
+            },
+          },
+        },
+      ]);
+      stats.forEach((s) => {
+        apptStats[s._id] = s;
+      });
+    }
+
+    const result = services.map((s) => {
+      const stats = apptStats[String(s.id)] || {};
+      const completed = stats.completed || 0;
+      return {
+        id: s.id,
+        name: s.name,
+        price: parseFloat(s.price) || 0,
+        image: s.image_url,
+        totalAppointments: stats.totalAppointments || 0,
+        completed,
+        canceled: stats.canceled || 0,
+        earning: completed * (parseFloat(s.price) || 0),
+      };
+    });
+
+    return res.json({ success: true, services: result, totalServices: result.length });
   } catch (err) {
     console.error("getServiceAppointmentStats:", err);
     return res.status(500).json({ success: false, message: "Server error" });

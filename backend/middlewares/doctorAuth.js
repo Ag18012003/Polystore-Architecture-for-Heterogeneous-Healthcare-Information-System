@@ -1,7 +1,6 @@
 // backend/middleware/doctorAuth.js
 import jwt from "jsonwebtoken";
-import Doctor from "../models/Doctor.js";
-
+import { pool } from "../config/mysql.js";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_here";
 
@@ -22,7 +21,6 @@ export default async function doctorAuth(req, res, next) {
     // 2. Verify token
     const payload = jwt.verify(token, JWT_SECRET);
 
-    // OPTIONAL: if you store role in token
     if (payload.role && payload.role !== "doctor") {
       return res.status(403).json({
         success: false,
@@ -30,18 +28,29 @@ export default async function doctorAuth(req, res, next) {
       });
     }
 
-    // 3. Fetch doctor
-    const doctor = await Doctor.findById(payload.id).select("-password");
+    // 3. Fetch doctor from MySQL
+    const [rows] = await pool.query(
+      "SELECT id, email, name, specialization, availability FROM doctors WHERE id = ?",
+      [payload.id]
+    );
 
-    if (!doctor) {
+    if (!rows.length) {
       return res.status(401).json({
         success: false,
         message: "Doctor not found",
       });
     }
 
+    const row = rows[0];
     // 4. Attach doctor to request
-    req.doctor = doctor;
+    req.doctor = {
+      id: row.id,
+      _id: String(row.id),
+      email: row.email,
+      name: row.name,
+      specialization: row.specialization,
+      availability: row.availability,
+    };
 
     next();
   } catch (err) {
