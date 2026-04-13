@@ -561,20 +561,42 @@ export default function ServiceDetail() {
             <h2 className={serviceDetailStyles.dateTitle}>Select Date *</h2>
             <div className={serviceDetailStyles.dateScrollContainer}>
               <div className={serviceDetailStyles.dateButtonsContainer}>
-                {service.dates.map((d) => (
-                  <button
-                    key={d}
-                    onClick={() => {
-                      setSelectedDate(d);
-                      setSelectedTime("");
-                    }}
-                    className={serviceDetailStyles.dateButton(
-                      selectedDate === d,
-                    )}
-                  >
-                    {d}
-                  </button>
-                ))}
+                {service.dates.length === 0 && (
+                  <div className={serviceDetailStyles.noDateMessage}>
+                    No dates available for this service.
+                  </div>
+                )}
+                {service.dates.map((d) => {
+                  const [yr, mo, dy] = d.split("-").map(Number);
+                  const dateObj = new Date(yr, mo - 1, dy);
+                  const isSelected = selectedDate === d;
+                  return (
+                    <button
+                      key={d}
+                      onClick={() => {
+                        setSelectedDate(d);
+                        setSelectedTime("");
+                      }}
+                      className={serviceDetailStyles.dateButton(isSelected)}
+                    >
+                      <div className={serviceDetailStyles.dateCardContent}>
+                        <div className={serviceDetailStyles.dateCardWeekday}>
+                          {dateObj.toLocaleDateString("en-US", {
+                            weekday: "short",
+                          })}
+                        </div>
+                        <div className={serviceDetailStyles.dateCardDay}>
+                          {dateObj.getDate()}
+                        </div>
+                        <div className={serviceDetailStyles.dateCardMonth}>
+                          {dateObj.toLocaleDateString("en-US", {
+                            month: "short",
+                          })}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             </div>
           </div>

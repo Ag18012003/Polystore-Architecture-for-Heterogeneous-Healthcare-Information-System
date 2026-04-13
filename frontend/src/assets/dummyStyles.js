@@ -921,9 +921,14 @@ export const serviceDetailStyles = {
   dateSection: "mt-4",
   dateTitle: "text-xl font-semibold text-emerald-900 mb-2",
   dateScrollContainer: "overflow-x-auto -mx-2 px-2",
-  dateButtonsContainer: "inline-flex gap-3 sm:flex sm:flex-wrap",
-  dateButton: (isSelected) => 
-    `px-5 py-2 rounded-full cursor-pointer border transition whitespace-nowrap min-w-[140px] sm:min-w-0 ${isSelected ? "bg-emerald-600 border-emerald-600 text-white" : "bg-white border-emerald-300 text-emerald-700 hover:bg-emerald-100"}`,
+  dateButtonsContainer: "inline-flex gap-3 pb-2",
+  dateButton: (isSelected) =>
+    `p-2 sm:p-3 rounded-xl cursor-pointer border-2 transition-all whitespace-nowrap ${isSelected ? "bg-gradient-to-br from-emerald-500 to-green-500 text-white border-emerald-500 shadow-lg" : "bg-white text-gray-700 border-emerald-100 hover:border-emerald-300"}`,
+  dateCardContent: "text-center min-w-[48px]",
+  dateCardWeekday: "text-xs opacity-80",
+  dateCardDay: "text-xl font-bold",
+  dateCardMonth: "text-xs opacity-80",
+  noDateMessage: "text-emerald-600/80 p-2 text-sm",
   
   // Time selection
   timeSection: "mt-4",
