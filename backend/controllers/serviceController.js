@@ -104,7 +104,7 @@ export async function createService(req, res) {
    ----------------------- */
 export async function getServices(req, res) {
   try {
-    const list = await Service.find().sort({ createdAt: -1 }).lean();
+    const list = await Service.find().sort({ _id: -1 }).lean();
     return res.status(200).json({ success: true, data: list });
   } catch (err) {
     console.error("getServices error:", err);
