@@ -1,0 +1,15 @@
+git clone https://github.com/Ag18012003/Polystore-Architecture-for-Heterogeneous-Healthcare-Information-System.git
+cd Polystore-Architecture-for-Heterogeneous-Healthcare-Information-System
+
+# Create backend files
+mkdir -p backend/config backend/models backend/routes
+# Add all the backend files above
+
+# Create frontend files  
+mkdir -p frontend/src/pages frontend/src/components
+# Add all the frontend files above
+
+# Commit and push
+git add .
+git commit -m "Add complete backend and frontend code"
+git push origin main
