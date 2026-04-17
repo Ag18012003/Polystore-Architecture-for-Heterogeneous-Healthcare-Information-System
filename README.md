@@ -313,8 +313,8 @@ npx kill-port 5174
 ## 📞 Support
 
 For issues or questions:
-- Email: hexagonsservices@gmail.com
-- Call: 8299431275
+- Email: 252211003@nitdelhi.ac.in
+- Call: 9818628122
 
 ## 📄 License
 
